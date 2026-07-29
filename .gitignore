@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pt
+unique_objects.jpg
+*_aligned.jpg
+*_aligned.png
