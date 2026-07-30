@@ -29,11 +29,15 @@ collected by the dataset author in additional folders alongside it.
 ```
 Remove360_based/             pairs derived from Remove360 (see below)
 └── <scene>/                 backyard, bedroom, living-room, office, park, stairwell
-    └── pair_<nn>/           pair_01, pair_02, ... (contiguous per scene)
-        ├── before.jpg       aligned image with the object present
-        ├── after.jpg        image with the object missing
+    └── pair_<nn>/           pair_01, pair_02, ...
+        ├── before.jpg       aligned earlier image
+        ├── after.jpg        later image
         └── label.json       {"missing": true, "items": ["<removed object>"]}
+                             or {"missing": false, "items": []} for no-change pairs
 ```
+
+Negative (no-change) pairs additionally carry a `source` field in
+`label.json` documenting which images they were built from.
 
 Additional collections of original photographs follow the same
 pair-folder layout with `before.jpg`, `after.jpg`, and `label.json`.
@@ -50,19 +54,20 @@ outdoor scenes. Its before and after images are independent captures — they
 are **not** pixel-aligned pairs — so this subset was built by finding and
 aligning the closest matching viewpoints between the two walks.
 
-124 pairs across 6 scenes and 9 removed objects:
+146 pairs — 124 positives (something was removed) and 22 negatives (nothing
+changed) — across 6 scenes and 9 removed objects:
 
-| scene | pairs | | removed object | pairs |
-|---|---|---|---|---|
-| backyard | 53 | | chairs | 36 |
-| stairwell | 24 | | backpack | 24 |
-| living-room | 21 | | stroller | 16 |
-| office | 13 | | sofa | 15 |
-| park | 10 | | deckchair | 11 |
-| bedroom | 3 | | bicycle | 10 |
-| | | | pillows | 6 |
-| | | | table | 3 |
-| | | | toy-truck | 3 |
+| scene | positive | negative | | removed object | pairs |
+|---|---|---|---|---|---|
+| backyard | 53 | 7 | | chairs | 36 |
+| stairwell | 24 | 7 | | backpack | 24 |
+| living-room | 21 | 5 | | stroller | 16 |
+| office | 13 | 1 | | sofa | 15 |
+| park | 10 | 2 | | deckchair | 11 |
+| bedroom | 3 | 0 | | bicycle | 10 |
+| | | | | pillows | 6 |
+| | | | | table | 3 |
+| | | | | toy-truck | 3 |
 
 ### How it was generated
 
@@ -93,6 +98,14 @@ aligning the closest matching viewpoints between the two walks.
 7. **Manual curation** — the automatically accepted pairs were reviewed and
    some were deleted by hand; the remaining pairs were renumbered
    contiguously.
+8. **No-change negatives** — within one scene, the before images of two
+   different pairs that share the same removed-item label come from the same
+   pre-removal camera walk (the item is present in both), and likewise the
+   after images from the same post-removal walk (absent in both). Such
+   same-side image pairs were matched and aligned with the same gates as the
+   positives — with mutual frame coverage additionally capped at 96% so
+   overlap statistics cannot separate the classes — and saved as
+   `{"missing": false}` pairs.
 
 ### Known limitations
 

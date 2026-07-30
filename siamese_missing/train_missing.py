@@ -229,12 +229,16 @@ def cmd_train(args):
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}\n")
 
-    rows = load_pairs(args.root, reverse_positives=not args.no_reverse)
+    rows = load_pairs(args.root, reverse_positives=not args.no_reverse,
+                      identity_negatives=args.identity_negatives)
     cache = ImageCache(args.cache_side).warm(rows) if args.cache else None
     print()
 
     results = []
     for k, (tr_rows, va_rows) in enumerate(scene_folds(rows, args.folds, args.seed)):
+        # identity negatives are train-only: without augmentation they are
+        # pixel-identical and would flatter validation
+        va_rows = [r for r in va_rows if not r.get("identity", False)]
         r = train_fold(tr_rows, va_rows, args, device, k, cache)
         results.append(r)
         print(f"fold {k}: {r['n_val']:3d} val pairs | AUC {r['auc']:.3f} | "
@@ -352,6 +356,9 @@ def main():
     t.add_argument("--cache-side", type=int, default=640)
     t.add_argument("--no-reverse", action="store_true",
                    help="skip synthesised reversed negatives")
+    t.add_argument("--identity-negatives", action="store_true",
+                   help="add same-photo no-change negatives (for datasets "
+                        "with no natural negative pairs)")
     t.set_defaults(func=cmd_train)
 
     p = sub.add_parser("predict")

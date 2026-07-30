@@ -42,15 +42,21 @@ def _is_positive(meta):
     return m is True or (isinstance(m, list) and len(m) > 0)
 
 
-def load_pairs(root, reverse_positives=True, verbose=True):
+def load_pairs(root, reverse_positives=True, identity_negatives=False, verbose=True):
     """
     Returns a list of dicts:
-        {before, after, y, scene, items, reversed, pair}
+        {before, after, y, scene, items, reversed, identity, pair}
 
     `y` is 1.0 if something went missing. Reversed rows carry y=0.0 and keep
     the same `scene`, so scene-grouped CV keeps a reversal in the same fold as
     its source -- otherwise the model sees the same photographs in train and
     val and validation becomes meaningless.
+
+    identity_negatives adds one y=0.0 row per positive that points the same
+    file at both slots (alternating before/after as the source). Train-time
+    jitter and independent photometric augmentation keep the two crops from
+    being pixel-identical, teaching "same scene, new shot != item gone" when
+    the dataset has no natural no-change pairs.
     """
     root = Path(root)
     if not root.is_dir():
@@ -85,7 +91,7 @@ def load_pairs(root, reverse_positives=True, verbose=True):
             "before": before, "after": after,
             "y": 1.0 if positive else 0.0,
             "scene": scene, "items": meta.get("items", []),
-            "reversed": False, "pair": pair_dir.name,
+            "reversed": False, "identity": False, "pair": pair_dir.name,
         })
 
         if positive and reverse_positives:
@@ -93,7 +99,16 @@ def load_pairs(root, reverse_positives=True, verbose=True):
                 "before": after, "after": before,      # swapped
                 "y": 0.0,
                 "scene": scene, "items": [],
-                "reversed": True, "pair": pair_dir.name,
+                "reversed": True, "identity": False, "pair": pair_dir.name,
+            })
+
+        if positive and identity_negatives:
+            src = before if len(rows) % 2 == 0 else after
+            rows.append({
+                "before": src, "after": src,           # same file twice
+                "y": 0.0,
+                "scene": scene, "items": [],
+                "reversed": False, "identity": True, "pair": pair_dir.name,
             })
 
     if verbose:
@@ -105,15 +120,17 @@ def summarise(rows, problems=()):
     scenes = sorted({r["scene"] for r in rows})
     pos = int(sum(r["y"] for r in rows))
     rev = sum(r["reversed"] for r in rows)
+    idn = sum(r.get("identity", False) for r in rows)
     files = len({r["before"] for r in rows} | {r["after"] for r in rows})
 
-    print(f"{len(rows)} pairs ({len(rows)-rev} real + {rev} reversed) "
-          f"from {files} image files")
+    print(f"{len(rows)} pairs ({len(rows)-rev-idn} real + {rev} reversed "
+          f"+ {idn} identity) from {files} image files")
     print(f"  scenes:   {len(scenes)}")
     print(f"  positive: {pos}   negative: {len(rows)-pos}")
 
     for s in scenes:
-        sr = [r for r in rows if r["scene"] == s and not r["reversed"]]
+        sr = [r for r in rows if r["scene"] == s and not r["reversed"]
+              and not r.get("identity", False)]
         p = sum(r["y"] for r in sr)
         if len(sr) > 2 and p in (0, len(sr)):
             print(f"  WARNING: scene {s} is entirely "
