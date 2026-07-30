@@ -1,0 +1,9 @@
+torch>=2.0
+timm>=0.9
+albumentations>=1.4,<2.0
+opencv-python>=4.8
+scikit-learn>=1.3
+numpy>=1.24
+
+# only for the optional detector scripts (missing_items.py, bootstrap_labels.py)
+ultralytics>=8.1

@@ -1,0 +1,7 @@
+Data layout is two levels — data/<scene>/<pair>/{before.jpg, after.jpg, label.json} — with {"missing": true, "items": ["cup"]} as the minimum label.
+
+pip install -r requirements.txt
+python pairs_io.py data                              # validate the tree
+python train_missing.py train --root data --cache    # 5-fold, saves fold0..4.pt
+python train_missing.py predict --before a.jpg --after b.jpg
+python train_missing.py evaluate --root holdout --cache

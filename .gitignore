@@ -4,3 +4,7 @@ __pycache__/
 unique_objects.jpg
 *_aligned.jpg
 *_aligned.png
+.env
+Remove360/*
+!Remove360/make_aligned_pairs.py
+somethings_missing_here/Remove360_based/
