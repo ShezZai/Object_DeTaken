@@ -7,7 +7,8 @@ Two photos of a scene in, one boolean out: did anything go missing?
 | File | Role |
 |---|---|
 | `pairs_io.py` | Reads the folder tree into memory, synthesises reversed negatives, image cache, scene-grouped folds |
-| `train_missing.py` | **Main entry point.** `train` / `predict` / `evaluate` |
+| `train_missing.py` | **Main entry point.** `train` / `predict` / `evaluate` (PyTorch) |
+| `train_missing_keras.py` | Keras 3 port of the same CLI: EfficientNetB0 backbone, saves `kfold<k>.keras` + `.json` sidecar |
 | `missing_items.py` | Detector-diff baseline (YOLO). Standalone, no training |
 | `bootstrap_labels.py` | Optional: pre-label pairs with the detector so you hand-correct instead of annotating from scratch |
 | `requirements.txt` | Dependencies |
@@ -98,6 +99,15 @@ Evaluate on a held-out folder (natural pairs only, no reversals):
 
 ```bash
 python train_missing.py evaluate --root holdout --cache
+```
+
+Keras variant (same commands and flags; needs `tensorflow>=2.17`, saves
+`kfold0.keras` … plus `.json` sidecars; uses EfficientNetB0 since
+keras.applications has no ResNet18):
+
+```bash
+python train_missing_keras.py train --root data --cache
+python train_missing_keras.py predict --before a.jpg --after b.jpg
 ```
 
 Optional detector baseline and label bootstrap:
