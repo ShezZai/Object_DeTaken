@@ -1,10 +1,18 @@
 .venv/
 __pycache__/
+.env
+
+# model checkpoints (.json = keras sidecar with threshold/metadata)
 *.pt
+*.keras
+siamese_missing/*.json
+
+# generated images
 unique_objects.jpg
 *_aligned.jpg
 *_aligned.png
-.env
-Remove360/*
-!Remove360/make_aligned_pairs.py
-somethings_missing_here/Remove360_based/
+
+# datasets (raw Remove360 download; curated set lives on HF)
+Remove360/
+somethings_missing_here/training/
+somethings_missing_here/test/

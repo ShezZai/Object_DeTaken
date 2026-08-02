@@ -21,30 +21,46 @@ after they were removed, with a label naming what went missing.
 
 The dataset originated from pairs derived from the
 [simkoc/Remove360](https://huggingface.co/datasets/simkoc/Remove360) dataset
-(the `Remove360_based/` folder), and is extended with original photographs
-collected by the dataset author in additional folders alongside it.
+(`training/Remove360_based/`), extended with original photographs collected
+by the dataset author (`training/DeTaken/`), plus a held-out `test/` split of
+scenes that appear nowhere in training.
 
 ## Structure
 
 ```
-Remove360_based/             pairs derived from Remove360 (see below)
-└── <scene>/                 backyard, bedroom, living-room, office, park, stairwell
-    └── pair_<nn>/           pair_01, pair_02, ...
-        ├── before.jpg       aligned earlier image
-        ├── after.jpg        later image
-        └── label.json       {"missing": true, "items": ["<removed object>"]}
-                             or {"missing": false, "items": []} for no-change pairs
+training/
+├── DeTaken/                 original photographs by the dataset author
+│   └── <scene>/             boxes, cabinet_window, magnets, red_stool, ...
+│       └── pair_<nn>/
+│           ├── before.jpg   earlier image
+│           ├── after.jpg    later image
+│           └── label.json   {"missing": true, "items": ["<removed object>"]}
+│                            or {"missing": false, "items": []} for no-change pairs
+└── Remove360_based/         pairs derived from Remove360 (see below)
+    └── <scene>/             backyard, bedroom, living-room, office, park, stairwell
+        └── pair_<nn>/       same pair layout
+test/
+└── <scene>/                 held-out scenes, never in training
+    └── pair_<nn>/           same pair layout (test_broom, test_chair, ...
+                             one pair each; michal_1 has 17 pairs)
 ```
 
-Negative (no-change) pairs additionally carry a `source` field in
-`label.json` documenting which images they were built from.
+Overview:
 
-Additional collections of original photographs follow the same
-pair-folder layout with `before.jpg`, `after.jpg`, and `label.json`.
+| split | collection | scenes | pairs | positive | negative |
+|---|---|---|---|---|---|
+| training | DeTaken | 13 | 87 | 50 | 37 |
+| training | Remove360_based | 6 | 146 | 124 | 22 |
+| test | — | 8 | 24 | 24 | 0 |
 
-Within a pair, `before.jpg` is aligned to `after.jpg`'s camera frame and
-both images are cropped to their shared valid region, so the two images are
-pixel-aligned and have identical dimensions.
+Remove360-derived negative (no-change) pairs additionally carry a `source`
+field in `label.json` documenting which images they were built from.
+
+In `Remove360_based/` pairs, `before.jpg` is warped into `after.jpg`'s
+camera frame and both images are cropped to their shared valid region, so
+the two images are pixel-aligned with identical dimensions. `DeTaken/` and
+`test/` pairs are handheld re-shots from approximately the same viewpoint
+and are not pixel-aligned.
 
 ## The Remove360_based subset
 

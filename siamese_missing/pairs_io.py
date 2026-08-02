@@ -12,8 +12,12 @@ negatives (removing an item, read backwards, is adding one).
 Because a reversed pair points at the SAME two files as its source, the cache
 makes reversal free: no extra decode, no extra pixels held in RAM.
 
-Layout expected:
-    data/scene_03/pair_001/{before.jpg, after.jpg, label.json}
+Layout expected: pair folders {before.jpg, after.jpg, label.json} at ANY
+depth under the root; the pair's parent path relative to the root is its
+scene id, so collections stay distinct scenes:
+    data/scene_03/pair_001/...                 -> scene "scene_03"
+    data/DeTaken/boxes/pair_01/...             -> scene "DeTaken/boxes"
+    data/Remove360_based/backyard/pair_01/...  -> scene "Remove360_based/backyard"
     label.json: {"missing": true, "items": ["cup"]}
 """
 
@@ -64,7 +68,12 @@ def load_pairs(root, reverse_positives=True, identity_negatives=False, verbose=T
 
     rows, problems = [], []
 
-    for pair_dir in sorted(p for p in root.glob("*/*") if p.is_dir()):
+    # A pair folder is any directory holding a before or after image, however
+    # deeply nested (supports both scene/pair and collection/scene/pair).
+    pair_dirs = {p.parent for stem in ("before", "after")
+                 for ext in IMG_EXT for p in root.rglob(f"{stem}{ext}")}
+
+    for pair_dir in sorted(pair_dirs):
         before = _find_image(pair_dir, "before")
         after = _find_image(pair_dir, "after")
         label_file = pair_dir / "label.json"
@@ -85,7 +94,9 @@ def load_pairs(root, reverse_positives=True, identity_negatives=False, verbose=T
             continue
 
         positive = _is_positive(meta)
-        scene = pair_dir.parent.name
+        scene = str(pair_dir.parent.relative_to(root))
+        if scene == ".":
+            scene = root.name
 
         rows.append({
             "before": before, "after": after,

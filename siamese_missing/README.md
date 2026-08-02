@@ -40,7 +40,11 @@ holdout/            # same layout, scenes NEVER used in training
     └── pair_001/ ...
 ```
 
-Exactly two levels: `<scene>/<pair>/`. `.png` and `.jpeg` work too.
+Pair folders are found at ANY depth under the root; a pair's parent path
+relative to the root is its scene id. So both `<scene>/<pair>/` and
+collection layouts like `training/DeTaken/<scene>/<pair>/` work — scenes
+from different collections stay distinct (`DeTaken/boxes` vs
+`Remove360_based/backyard`). `.png` and `.jpeg` work too.
 
 ### `label.json`
 
@@ -82,6 +86,8 @@ Train (scene-grouped 5-fold, saves `fold0.pt` … `fold4.pt`):
 
 ```bash
 python train_missing.py train --root data --cache
+# e.g. on the somethings_missing_here dataset (both collections):
+python train_missing.py train --root ../somethings_missing_here/training --cache --identity-negatives
 ```
 
 Predict on one new pair (ensembles all fold checkpoints, hflip TTA):
@@ -99,6 +105,8 @@ Evaluate on a held-out folder (natural pairs only, no reversals):
 
 ```bash
 python train_missing.py evaluate --root holdout --cache
+# e.g. the somethings_missing_here held-out split:
+python train_missing.py evaluate --root ../somethings_missing_here/test --cache
 ```
 
 Keras variant (same commands and flags; needs `tensorflow>=2.17`, saves

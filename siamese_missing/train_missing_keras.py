@@ -124,6 +124,14 @@ class PairSequence(keras.utils.PyDataset):
 def build_model(size=(256, 256), pretrained=True, p_drop=0.4):
     h, w = size
     # ONE backbone applied to both inputs == shared weights (the siamese part).
+    # In the functional API, calling the same layer instance twice creates two
+    # graph nodes over one set of parameters; summary() shows two branches but
+    # count_params() counts the backbone once. Not two encoders: (1) the head
+    # subtracts features, which only means anything if both images are embedded
+    # in the same feature space -- independent encoders drift apart and make
+    # fa - fb arbitrary; (2) a second encoder would double the parameters on a
+    # tiny dataset; (3) before/after are the same kind of image, so there is
+    # nothing for a second encoder to specialise on.
     # EfficientNet includes its input rescaling/normalization layers, so the
     # model takes raw 0-255 images.
     backbone = keras.applications.EfficientNetB0(
@@ -134,7 +142,9 @@ def build_model(size=(256, 256), pretrained=True, p_drop=0.4):
     inp_a = keras.Input((h, w, 3), name="before")
     inp_b = keras.Input((h, w, 3), name="after")
     fa, fb = backbone(inp_a), backbone(inp_b)
-    # SIGNED difference: the sign separates 'removed' from 'added'
+    # SIGNED difference: the sign separates 'removed' from 'added'.
+    # abs() would be symmetric and could not tell the two apart, which is
+    # exactly the distinction the reversed-pair negatives train.
     x = layers.Concatenate()([fa, fb, layers.Subtract()([fa, fb])])
     x = layers.Dropout(0.2)(x)
     x = layers.Dense(128)(x)
@@ -328,10 +338,14 @@ def cmd_evaluate(args):
     if tp + fn:
         print(f"recall {tp / (tp + fn):.3f}")
 
-    print("\nworst mistakes:")
-    for i in np.argsort(-np.abs(p - y))[:10]:
+    failures = np.where((p > thr) != (y == 1))[0]
+    print(f"\nfailed pairs ({len(failures)}/{len(rows)}):")
+    for i in sorted(failures, key=lambda i: -abs(p[i] - y[i])):
         r = rows[i]
-        print(f"  p={p[i]:.3f} y={y[i]:.0f}  {r['scene']}/{r['pair']}")
+        kind = "missed" if y[i] == 1 else "false alarm"
+        items = ", ".join(r["items"]) or "-"
+        print(f"  {kind:11s} p={p[i]:.3f} (thr {thr:.3f})  "
+              f"{r['scene']}/{r['pair']}  items: {items}")
 
 
 # --------------------------------------------------------------------------- #
