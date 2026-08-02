@@ -2,8 +2,8 @@ torch>=2.0
 timm>=0.9
 albumentations>=1.4,<2.0
 
-# only for the Keras variant (train_missing_keras.py)
-tensorflow>=2.17
+# only for the --keras implementation (runs on the torch backend)
+keras>=3.0
 opencv-python>=4.8
 scikit-learn>=1.3
 numpy>=1.24
