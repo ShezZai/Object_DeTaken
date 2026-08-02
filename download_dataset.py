@@ -7,12 +7,18 @@ environment variable, or from the .env file next to this script
 
     python download_dataset.py                # into ./somethings_missing_here
     python download_dataset.py --output /elsewhere
+    python download_dataset.py --fresh        # wipe the local copy first
+
+A plain run is an incremental update: new and changed files are fetched,
+but files deleted or renamed on the Hub linger locally. --fresh removes the
+local copy first so the result mirrors the Hub exactly.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import shutil
 from pathlib import Path
 
 from huggingface_hub import snapshot_download
@@ -42,6 +48,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path,
                         default=ROOT / "somethings_missing_here",
                         help="target folder (default: ./somethings_missing_here)")
+    parser.add_argument("--fresh", action="store_true",
+                        help="delete the local copy first and re-download "
+                             "from scratch (removes stale renamed/deleted files)")
     return parser.parse_args()
 
 
@@ -51,6 +60,17 @@ def main() -> None:
     if token is None:
         raise SystemExit(
             "error: no HF token found -- set HF_TOKEN or put it in .env")
+
+    if args.fresh and args.output.exists():
+        # Only wipe something that actually looks like a dataset copy, so a
+        # mistyped --output cannot delete an unrelated folder.
+        markers = ("README.md", "training", "test", ".cache")
+        if not any((args.output / m).exists() for m in markers):
+            raise SystemExit(
+                f"error: {args.output} does not look like a dataset copy; "
+                "refusing to delete it")
+        print(f"Removing local copy at {args.output}")
+        shutil.rmtree(args.output)
 
     path = snapshot_download(args.repo, repo_type="dataset",
                              local_dir=args.output, token=token)

@@ -211,13 +211,32 @@ class ImageCache:
 
 # --------------------------------------------------------------------------- #
 def scene_folds(rows, n_folds=5, seed=42):
-    """Yield (train_rows, val_rows) with whole scenes held out."""
+    """Yield (train_rows, val_rows) with whole scenes held out.
+
+    Scenes are packed greedily by pair count (largest scene into the
+    currently lightest fold) so validation sets end up near-equal in SIZE,
+    not just in scene count -- scene sizes can differ 10x, and a 6-sample
+    validation fold measures nothing. The seed shuffles first so equal-size
+    scenes break ties differently across seeds.
+    """
     scenes = sorted({r["scene"] for r in rows})
     if len(scenes) < n_folds:
         raise ValueError(f"need >= {n_folds} scenes, found {len(scenes)}")
+
+    counts = {s: 0 for s in scenes}
+    for r in rows:
+        counts[r["scene"]] += 1
+
     order = np.random.default_rng(seed).permutation(scenes)
-    for chunk in np.array_split(order, n_folds):
-        held = set(chunk)
+    order = sorted(order, key=lambda s: -counts[s])
+    fold_scenes = [set() for _ in range(n_folds)]
+    fold_sizes = [0] * n_folds
+    for scene in order:
+        lightest = min(range(n_folds), key=lambda k: fold_sizes[k])
+        fold_scenes[lightest].add(scene)
+        fold_sizes[lightest] += counts[scene]
+
+    for held in fold_scenes:
         yield ([r for r in rows if r["scene"] not in held],
                [r for r in rows if r["scene"] in held])
 

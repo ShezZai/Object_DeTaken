@@ -5,6 +5,7 @@ __pycache__/
 # model checkpoints (.json = keras sidecar with threshold/metadata)
 *.pt
 *.keras
+*.jpg
 siamese_missing/*.json
 !siamese_missing/example.json
 
