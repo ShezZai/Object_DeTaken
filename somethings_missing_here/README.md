@@ -27,6 +27,8 @@ scenes that appear nowhere in training.
 
 ## Structure
 
+Both splits are organized by collection, then scene, then pair:
+
 ```
 training/
 ├── DeTaken/                 original photographs by the dataset author
@@ -37,12 +39,14 @@ training/
 │           └── label.json   {"missing": true, "items": ["<removed object>"]}
 │                            or {"missing": false, "items": []} for no-change pairs
 └── Remove360_based/         pairs derived from Remove360 (see below)
-    └── <scene>/             backyard, bedroom, living-room, office, park, stairwell
-        └── pair_<nn>/       same pair layout
+    └── <scene>/             backyard_big_tree, backyard_bricks, backyard_toys,
+        └── pair_<nn>/       bedroom, living-room, office, park, stairwell
 test/
-└── <scene>/                 held-out scenes, never in training
-    └── pair_<nn>/           same pair layout (test_broom, test_chair, ...
-                             one pair each; michal_1 has 17 pairs)
+├── DeTaken/                 held-out scenes, never in training
+│   └── test_<scene>/        test_broom, test_chair, ... (one pair each;
+│       └── pair_<nn>/       test_michal_01 has 17 pairs)
+└── Remove360_based/
+    └── test_backyard/       3 held-out Remove360 pairs
 ```
 
 Overview:
@@ -50,17 +54,18 @@ Overview:
 | split | collection | scenes | pairs | positive | negative |
 |---|---|---|---|---|---|
 | training | DeTaken | 13 | 87 | 50 | 37 |
-| training | Remove360_based | 6 | 146 | 124 | 22 |
-| test | — | 8 | 24 | 24 | 0 |
+| training | Remove360_based | 8 | 143 | 121 | 22 |
+| test | DeTaken | 8 | 24 | 24 | 0 |
+| test | Remove360_based | 1 | 3 | 3 | 0 |
 
 Remove360-derived negative (no-change) pairs additionally carry a `source`
 field in `label.json` documenting which images they were built from.
 
-In `Remove360_based/` pairs, `before.jpg` is warped into `after.jpg`'s
-camera frame and both images are cropped to their shared valid region, so
-the two images are pixel-aligned with identical dimensions. `DeTaken/` and
-`test/` pairs are handheld re-shots from approximately the same viewpoint
-and are not pixel-aligned.
+In `Remove360_based/` pairs (both splits), `before.jpg` is warped into
+`after.jpg`'s camera frame and both images are cropped to their shared valid
+region, so the two images are pixel-aligned with identical dimensions.
+`DeTaken/` pairs (both splits) are handheld re-shots from approximately the
+same viewpoint and are not pixel-aligned.
 
 ## The Remove360_based subset
 
@@ -71,19 +76,22 @@ are **not** pixel-aligned pairs — so this subset was built by finding and
 aligning the closest matching viewpoints between the two walks.
 
 146 pairs — 124 positives (something was removed) and 22 negatives (nothing
-changed) — across 6 scenes and 9 removed objects:
+changed) — across 9 scenes and 9 removed objects. Remove360's single large
+backyard scene is split into three sub-scenes by area (big tree lawn, brick
+patio, toy corner), and 3 backyard pairs are held out as `test/`
+`Remove360_based/test_backyard`:
 
 | scene | positive | negative | | removed object | pairs |
 |---|---|---|---|---|---|
-| backyard | 53 | 7 | | chairs | 36 |
-| stairwell | 24 | 7 | | backpack | 24 |
-| living-room | 21 | 5 | | stroller | 16 |
-| office | 13 | 1 | | sofa | 15 |
-| park | 10 | 2 | | deckchair | 11 |
-| bedroom | 3 | 0 | | bicycle | 10 |
-| | | | | pillows | 6 |
-| | | | | table | 3 |
-| | | | | toy-truck | 3 |
+| backyard_toys | 23 | 5 | | chairs | 36 |
+| backyard_bricks | 16 | 0 | | backpack | 24 |
+| backyard_big_tree | 11 | 2 | | stroller | 16 |
+| stairwell | 24 | 7 | | sofa | 15 |
+| living-room | 21 | 5 | | deckchair | 11 |
+| office | 13 | 1 | | bicycle | 10 |
+| park | 10 | 2 | | pillows | 6 |
+| bedroom | 3 | 0 | | table | 3 |
+| test_backyard (test) | 3 | 0 | | toy-truck | 3 |
 
 ### How it was generated
 

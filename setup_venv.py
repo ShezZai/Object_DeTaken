@@ -8,6 +8,7 @@ instead of bin/). Run with whatever Python you want the venv to use:
     py setup_venv.py             # Windows
 """
 
+import shutil
 import subprocess
 import sys
 import venv
@@ -15,6 +16,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
+
+# PyPI's Windows torch wheels are CPU-only; the CUDA builds live on
+# pytorch.org's own index. cu128 covers Ada and Blackwell GPUs alike.
+# (Linux/macOS need nothing special: PyPI wheels already include CUDA / MPS.)
+WINDOWS_CUDA_INDEX = "https://download.pytorch.org/whl/cu128"
 
 
 def venv_python() -> Path:
@@ -34,6 +40,13 @@ def main() -> None:
     print("Installing dependencies from requirements.txt")
     subprocess.run([python, "-m", "pip", "install", "--upgrade", "pip"],
                    check=True)
+
+    # On Windows with an NVIDIA GPU, install CUDA torch first so the
+    # requirements step's "torch>=2.0" is already satisfied by it.
+    if sys.platform == "win32" and shutil.which("nvidia-smi"):
+        print("NVIDIA GPU detected -- installing CUDA-enabled torch")
+        subprocess.run([python, "-m", "pip", "install", "torch",
+                        "--index-url", WINDOWS_CUDA_INDEX], check=True)
     subprocess.run([python, "-m", "pip", "install", "-r",
                     str(ROOT / "requirements.txt")], check=True)
 
