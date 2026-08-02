@@ -6,6 +6,7 @@ __pycache__/
 *.pt
 *.keras
 siamese_missing/*.json
+!siamese_missing/example.json
 
 # generated images
 unique_objects.jpg

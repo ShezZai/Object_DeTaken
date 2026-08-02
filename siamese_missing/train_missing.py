@@ -23,6 +23,7 @@ import argparse
 import glob
 import json
 import os
+import sys
 from pathlib import Path
 
 import albumentations as A
@@ -532,6 +533,9 @@ def make_pair_scorer(args, cache=None):
 
 
 def cmd_predict(args):
+    if not args.before or not args.after:
+        raise SystemExit("error: --before and --after are required "
+                         "(as flags or config keys)")
     resolve_defaults(args)
     models, score = make_pair_scorer(args)
     probs = [score(m, size, args.before, args.after) for m, size, _ in models]
@@ -547,6 +551,8 @@ def cmd_predict(args):
 
 
 def cmd_evaluate(args):
+    if not args.root:
+        raise SystemExit("error: --root is required (as a flag or config key)")
     resolve_defaults(args)
     # natural pairs only: reversals would flatter the score
     rows = load_pairs(args.root, reverse_positives=False)
@@ -583,6 +589,20 @@ def cmd_evaluate(args):
 
 
 # --------------------------------------------------------------------------- #
+def load_config(path):
+    """Read a JSON config whose keys mirror the CLI flags.
+
+    Keys may use dashes or underscores ("freeze-epochs" == "freeze_epochs").
+    An optional "cmd" key selects the subcommand so the whole invocation can
+    live in the file:  python train_missing.py --config run.json
+    Explicit CLI flags always override config values.
+    """
+    cfg = json.loads(Path(path).read_text())
+    if not isinstance(cfg, dict):
+        raise SystemExit(f"error: {path} must contain a JSON object")
+    return {k.replace("-", "_"): v for k, v in cfg.items()}
+
+
 def main():
     backend = argparse.ArgumentParser(add_help=False)
     group = backend.add_mutually_exclusive_group()
@@ -594,8 +614,12 @@ def main():
     backend.set_defaults(keras=False)
     backend.add_argument("--device", default=None,
                          help="cuda | cpu | mps (torch implementation only)")
+    backend.add_argument("--config", default=None,
+                         help="JSON file with flag values (CLI flags override)")
 
     ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default=None,
+                    help="JSON file with flag values; may include \"cmd\"")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     t = sub.add_parser("train", parents=[backend])
@@ -627,19 +651,46 @@ def main():
     p = sub.add_parser("predict", parents=[backend])
     p.add_argument("--ckpt", default=None,
                    help="checkpoint glob (default: fold*.pt / kfold*.keras)")
-    p.add_argument("--before", required=True)
-    p.add_argument("--after", required=True)
+    p.add_argument("--before", default=None, help="required (flag or config)")
+    p.add_argument("--after", default=None, help="required (flag or config)")
     p.set_defaults(func=cmd_predict)
 
     e = sub.add_parser("evaluate", parents=[backend])
-    e.add_argument("--root", required=True, help="held-out folder, same layout")
+    e.add_argument("--root", default=None,
+                   help="held-out folder, same layout; required (flag or config)")
     e.add_argument("--ckpt", default=None,
                    help="checkpoint glob (default: fold*.pt / kfold*.keras)")
     e.add_argument("--cache", action="store_true")
     e.add_argument("--cache-side", type=int, default=640)
     e.set_defaults(func=cmd_evaluate)
 
-    args = ap.parse_args()
+    # --config: pre-scan argv, then install config values as parser defaults
+    # for the target subcommand -- explicit CLI flags override naturally.
+    argv = sys.argv[1:]
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None)
+    known, _ = pre.parse_known_args(argv)
+    if known.config:
+        cfg = load_config(known.config)
+        subcommands = {"train": t, "predict": p, "evaluate": e}
+        cmd = next((a for a in argv if a in subcommands), None)
+        if cmd is None:
+            cmd = cfg.get("cmd")
+            if cmd not in subcommands:
+                raise SystemExit(
+                    "error: no subcommand on the command line and no valid "
+                    f"\"cmd\" in {known.config}")
+            argv = [cmd] + argv
+        parser = subcommands[cmd]
+        valid = {action.dest for action in parser._actions}
+        unknown = set(cfg) - valid - {"cmd"}
+        if unknown:
+            raise SystemExit(
+                f"error: unknown config keys for '{cmd}': "
+                f"{', '.join(sorted(unknown))}")
+        parser.set_defaults(**{k: v for k, v in cfg.items() if k != "cmd"})
+
+    args = ap.parse_args(argv)
     args.func(args)
 
 

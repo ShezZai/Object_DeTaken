@@ -119,6 +119,27 @@ python train_missing.py train --keras --root data --cache
 python train_missing.py predict --keras --before a.jpg --after b.jpg
 ```
 
+Any invocation can live in a JSON config instead of flags — keys mirror the
+flag names (dashes or underscores), an optional `"cmd"` key picks the
+subcommand, and explicit CLI flags override config values:
+
+```bash
+python train_missing.py --config run.json
+python train_missing.py train --config run.json --bs 8   # config + override
+```
+
+```json
+{
+  "cmd": "train",
+  "keras": true,
+  "root": "../somethings_missing_here/training",
+  "cache": true,
+  "identity-negatives": true,
+  "height": 384, "width": 384, "bs": 8,
+  "prefix": "kfold384_"
+}
+```
+
 Optional detector baseline and label bootstrap:
 
 ```bash
