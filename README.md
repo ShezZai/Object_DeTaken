@@ -12,9 +12,18 @@ no counterpart in picture 2.
 
 Requires Python 3.10+.
 
+Linux / macOS:
+
 ```bash
 ./setup_venv.sh
 source .venv/bin/activate
+```
+
+Windows:
+
+```powershell
+py setup_venv.py
+.venv\Scripts\Activate.ps1
 ```
 
 The script creates a `.venv` virtual environment and installs the dependencies

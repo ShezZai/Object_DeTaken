@@ -187,6 +187,23 @@ def confusion(y, p, thr):
             int(((pred == 0) & (y == 1)).sum()), int(((pred == 0) & (y == 0)).sum()))
 
 
+def epoch_progress(fold, epoch, args, auc, best, patience):
+    """Live one-line status: in-place on a terminal, one line per epoch when
+    piped (logs, Colab) so progress stays visible either way."""
+    line = (f"fold {fold} epoch {epoch + 1}/{args.epochs} | "
+            f"val AUC {auc:.3f} | best {best['auc']:.3f} @ epoch "
+            f"{best['epoch']} | patience {patience}/{args.patience}")
+    if sys.stdout.isatty():
+        print(f"\r  {line}   ", end="", flush=True)
+    else:
+        print(f"  {line}", flush=True)
+
+
+def epoch_progress_done():
+    if sys.stdout.isatty():
+        print("\r" + " " * 100 + "\r", end="", flush=True)
+
+
 # --------------------------------------------------------------------------- #
 # training (torch)
 # --------------------------------------------------------------------------- #
@@ -234,9 +251,12 @@ def train_fold(tr_rows, va_rows, args, device, fold, cache):
             patience = 0
         else:
             patience += 1
-            if patience >= args.patience:
-                break
 
+        epoch_progress(fold, epoch, args, auc, best, patience)
+        if patience >= args.patience:
+            break
+
+    epoch_progress_done()
     model.load_state_dict(best["state"])
     p, y = probs_and_labels(model, va, device)
     tp, fp, fn, tn = confusion(y, p, best["thr"])
@@ -394,9 +414,12 @@ def keras_impl():
                 patience = 0
             else:
                 patience += 1
-                if patience >= args.patience:
-                    break
 
+            epoch_progress(fold, epoch, args, auc, best, patience)
+            if patience >= args.patience:
+                break
+
+        epoch_progress_done()
         model.set_weights(best["weights"])
         p, y = k_probs_and_labels(model, va)
         tp, fp, fn, tn = confusion(y, p, best["thr"])
