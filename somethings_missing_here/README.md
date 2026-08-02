@@ -44,7 +44,7 @@ training/
 test/
 ├── DeTaken/                 held-out scenes, never in training
 │   └── test_<scene>/        test_broom, test_chair, ... (one pair each;
-│       └── pair_<nn>/       test_michal_01 has 17 pairs)
+│       └── pair_<nn>/       test_michal_01: 17 pairs, test_shay_01: 20)
 └── Remove360_based/
     └── test_backyard/       3 held-out Remove360 pairs
 ```
@@ -53,9 +53,9 @@ Overview:
 
 | split | collection | scenes | pairs | positive | negative |
 |---|---|---|---|---|---|
-| training | DeTaken | 13 | 87 | 50 | 37 |
+| training | DeTaken | 18 | 143 | 79 | 64 |
 | training | Remove360_based | 8 | 143 | 121 | 22 |
-| test | DeTaken | 8 | 24 | 24 | 0 |
+| test | DeTaken | 9 | 44 | 36 | 8 |
 | test | Remove360_based | 1 | 3 | 3 | 0 |
 
 Remove360-derived negative (no-change) pairs additionally carry a `source`
