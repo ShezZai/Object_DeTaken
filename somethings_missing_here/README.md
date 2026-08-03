@@ -23,7 +23,10 @@ The dataset originated from pairs derived from the
 [simkoc/Remove360](https://huggingface.co/datasets/simkoc/Remove360) dataset
 (`training/Remove360_based/`), extended with original photographs collected
 by the dataset author (`training/DeTaken/`), plus a held-out `test/` split of
-scenes that appear nowhere in training.
+scenes that appear nowhere in training. A separate `challenging/` split
+holds harder cases — object swaps, replacements, and rearrangements — where
+telling "something is missing" apart from "things merely changed" takes
+more than spotting a difference (see below).
 
 ## Structure
 
@@ -44,19 +47,27 @@ training/
 test/
 ├── DeTaken/                 held-out scenes, never in training
 │   └── test_<scene>/        test_broom, test_chair, ... (one pair each;
-│       └── pair_<nn>/       test_michal_01 has 17 pairs)
+│       └── pair_<nn>/       test_michal_01: 15 pairs, test_shay_01: 11)
 └── Remove360_based/
     └── test_backyard/       3 held-out Remove360 pairs
+challenging/                 harder cases: swaps, replacements, rearrangements
+├── training/
+│   └── <scene>/             same scene names as training/DeTaken
+│       └── pair_<nn>/
+└── test/
+    └── pair_<nn>/           held-out challenging pairs (flat)
 ```
 
 Overview:
 
 | split | collection | scenes | pairs | positive | negative |
 |---|---|---|---|---|---|
-| training | DeTaken | 13 | 87 | 50 | 37 |
+| training | DeTaken | 16 | 61 | 51 | 10 |
 | training | Remove360_based | 8 | 143 | 121 | 22 |
-| test | DeTaken | 8 | 24 | 24 | 0 |
+| test | DeTaken | 10 | 34 | 32 | 2 |
 | test | Remove360_based | 1 | 3 | 3 | 0 |
+| challenging | training | 17 | 81 | 27 | 54 |
+| challenging | test | 1 | 11 | 5 | 6 |
 
 Remove360-derived negative (no-change) pairs additionally carry a `source`
 field in `label.json` documenting which images they were built from.
@@ -64,8 +75,30 @@ field in `label.json` documenting which images they were built from.
 In `Remove360_based/` pairs (both splits), `before.jpg` is warped into
 `after.jpg`'s camera frame and both images are cropped to their shared valid
 region, so the two images are pixel-aligned with identical dimensions.
-`DeTaken/` pairs (both splits) are handheld re-shots from approximately the
-same viewpoint and are not pixel-aligned.
+`DeTaken/` and `challenging/` pairs are handheld re-shots from approximately
+the same viewpoint and are not pixel-aligned.
+
+## The challenging split
+
+`challenging/` holds the deliberately hard cases, separated from the main
+splits so models can be trained and evaluated with or without them. In the
+main splits, the change between `before` and `after` is a clean object
+removal (or nothing at all) seen under a small viewpoint change. In
+`challenging/`, other things happen too — objects are **swapped** with one
+another, **replaced** by different objects, or **rearranged** within the
+scene:
+
+- Its **negatives** (`missing: false`, the majority here) are hard: items
+  moved, swapped, or substituted — the scene visibly changed, yet nothing
+  went missing. A model leaning on "the images differ, so something is
+  gone" fails these.
+- Its **positives** (`missing: true`) hide a genuine removal among such
+  distractions, so spotting the difference is not enough — the model must
+  identify that the change is specifically a disappearance.
+
+Labels use the same `label.json` format. `challenging/test/` pairs are held
+out from all training and sit directly under the folder (no scene
+subfolders).
 
 ## The Remove360_based subset
 
