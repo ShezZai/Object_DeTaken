@@ -181,17 +181,37 @@ def best_threshold(y, p):
     return float(np.clip(thr[np.argmax(tpr - fpr)], 0.01, 0.99))
 
 
+def val_metric(name, y, p):
+    """(score, threshold) used for epoch selection and early stopping.
+
+    auc: threshold-independent ranking score, threshold from Youden's J.
+    acc: the best accuracy any threshold reaches, and that threshold --
+         optimises what the confusion matrix reports, at the cost of being a
+         noisier, step-shaped signal on small validation sets.
+    """
+    if name == "acc":
+        if len(set(y)) < 2:
+            return float(((p > 0.5) == (y == 1)).mean()), 0.5
+        _, _, thr = roc_curve(y, p)
+        accs = np.array([((p > t) == (y == 1)).mean() for t in thr])
+        i = int(accs.argmax())
+        return float(accs[i]), float(np.clip(thr[i], 0.01, 0.99))
+    auc = roc_auc_score(y, p) if len(set(y)) > 1 else float("nan")
+    return auc, best_threshold(y, p)
+
+
 def confusion(y, p, thr):
     pred = (p > thr).astype(float)
     return (int(((pred == 1) & (y == 1)).sum()), int(((pred == 1) & (y == 0)).sum()),
             int(((pred == 0) & (y == 1)).sum()), int(((pred == 0) & (y == 0)).sum()))
 
 
-def epoch_progress(fold, epoch, args, auc, best, patience):
+def epoch_progress(fold, epoch, args, score, best, patience):
     """Live one-line status: in-place on a terminal, one line per epoch when
     piped (logs, Colab) so progress stays visible either way."""
+    name = getattr(args, "metric", "auc")
     line = (f"fold {fold} epoch {epoch + 1}/{args.epochs} | "
-            f"val AUC {auc:.3f} | best {best['auc']:.3f} @ epoch "
+            f"val {name} {score:.3f} | best {best['score']:.3f} @ epoch "
             f"{best['epoch']} | patience {patience}/{args.patience}")
     if sys.stdout.isatty():
         print(f"\r  {line}   ", end="", flush=True)
@@ -202,6 +222,73 @@ def epoch_progress(fold, epoch, args, auc, best, patience):
 def epoch_progress_done():
     if sys.stdout.isatty():
         print("\r" + " " * 100 + "\r", end="", flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# grad-cam visualization
+# --------------------------------------------------------------------------- #
+def cam_overlay(image_rgb, cam):
+    """Blend a [0,1] cam heatmap over an RGB uint8 image."""
+    heat = cv2.applyColorMap(
+        (np.clip(cam, 0, 1) * 255).astype(np.uint8), cv2.COLORMAP_JET)[..., ::-1]
+    heat = cv2.resize(heat, (image_rgb.shape[1], image_rgb.shape[0]))
+    return (0.55 * image_rgb + 0.45 * heat).astype(np.uint8)
+
+
+def save_cam_panel(path, before_rgb, after_rgb, cam_before, cam_after, caption):
+    """before|after overlays side by side with a caption strip on top."""
+    panel = np.hstack([cam_overlay(before_rgb, cam_before),
+                       cam_overlay(after_rgb, cam_after)])
+    strip = np.full((28, panel.shape[1], 3), 255, dtype=np.uint8)
+    cv2.putText(strip, caption, (6, 19), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    cv2.imwrite(str(path), np.vstack([strip, panel])[..., ::-1])
+
+
+def torch_grad_cam(model, row, size, device, cache=None):
+    """Grad-CAM of the 'missing' logit at the encoder's last spatial layer.
+
+    Returns (before_rgb, after_rgb, cam_before, cam_after): the network's
+    actual inputs (denormalized) and one [0,1] heatmap per branch.
+    """
+    ds = PairSet([row], size, train=False, cache=cache)
+    a, b, _ = ds[0]
+    a, b = a[None].to(device), b[None].to(device)
+
+    # find the last leaf module that outputs a spatial map
+    spatial = []
+    probes = [m.register_forward_hook(
+        lambda mod, i, o: spatial.append(mod)
+        if torch.is_tensor(o) and o.dim() == 4 else None)
+        for m in model.enc.modules() if not list(m.children())]
+    with torch.no_grad():
+        model.enc(a)
+    for h in probes:
+        h.remove()
+    target = spatial[-1]
+
+    acts = []
+    def keep(mod, inp, out):
+        out.retain_grad()
+        acts.append(out)
+    hook = target.register_forward_hook(keep)
+    with torch.enable_grad():
+        logit = model(a, b)
+        model.zero_grad(set_to_none=True)
+        logit.backward()
+    hook.remove()
+
+    cams = []
+    for act in acts[:2]:                       # enc(a) first, enc(b) second
+        weight = act.grad.mean(dim=(2, 3), keepdim=True)
+        cam = torch.relu((weight * act).sum(1)).squeeze(0)
+        cams.append((cam / (cam.max() + 1e-8)).detach().cpu().numpy())
+
+    def denorm(t):
+        img = (t[0].cpu() * STD + MEAN).clamp(0, 1) * 255
+        return img.permute(1, 2, 0).numpy().astype(np.uint8)
+
+    return denorm(a), denorm(b), cams[0], cams[1]
 
 
 # --------------------------------------------------------------------------- #
@@ -223,7 +310,7 @@ def train_fold(tr_rows, va_rows, args, device, fold, cache):
                             lr=1e-3, weight_decay=1e-4)
     crit = nn.BCEWithLogitsLoss()
 
-    best = {"auc": -1.0, "thr": 0.5, "state": None, "epoch": -1}
+    best = {"score": -1.0, "auc": -1.0, "thr": 0.5, "state": None, "epoch": -1}
     patience = 0
 
     for epoch in range(args.epochs):
@@ -243,16 +330,18 @@ def train_fold(tr_rows, va_rows, args, device, fold, cache):
 
         p, y = probs_and_labels(model, va, device)
         auc = roc_auc_score(y, p) if len(set(y)) > 1 else float("nan")
+        score, thr = val_metric(args.metric, y, p)
 
-        if auc > best["auc"]:
-            best = {"auc": float(auc), "thr": best_threshold(y, p), "epoch": epoch,
+        if score > best["score"]:
+            best = {"score": float(score), "auc": float(auc), "thr": thr,
+                    "epoch": epoch,
                     "state": {k: v.detach().cpu().clone()
                               for k, v in model.state_dict().items()}}
             patience = 0
         else:
             patience += 1
 
-        epoch_progress(fold, epoch, args, auc, best, patience)
+        epoch_progress(fold, epoch, args, score, best, patience)
         if patience >= args.patience:
             break
 
@@ -395,7 +484,8 @@ def keras_impl():
         model.backbone.trainable = False   # frozen BN stays in inference mode
         compile_model(model, lr=1e-3)
 
-        best = {"auc": -1.0, "thr": 0.5, "weights": None, "epoch": -1}
+        best = {"score": -1.0, "auc": -1.0, "thr": 0.5,
+                "weights": None, "epoch": -1}
         patience = 0
 
         for epoch in range(args.epochs):
@@ -407,15 +497,16 @@ def keras_impl():
 
             p, y = k_probs_and_labels(model, va)
             auc = roc_auc_score(y, p) if len(set(y)) > 1 else float("nan")
+            score, thr = val_metric(args.metric, y, p)
 
-            if auc > best["auc"]:
-                best = {"auc": float(auc), "thr": best_threshold(y, p),
+            if score > best["score"]:
+                best = {"score": float(score), "auc": float(auc), "thr": thr,
                         "epoch": epoch, "weights": model.get_weights()}
                 patience = 0
             else:
                 patience += 1
 
-            epoch_progress(fold, epoch, args, auc, best, patience)
+            epoch_progress(fold, epoch, args, score, best, patience)
             if patience >= args.patience:
                 break
 
@@ -458,10 +549,43 @@ def keras_impl():
                                           np.flip(b, 2).copy())).squeeze()]
         return float(1.0 / (1.0 + np.exp(-np.mean(logits))))
 
+    def k_grad_cam(model, row, size, cache=None):
+        """Grad-CAM under the torch backend: split the model at the
+        backbone's last spatial layer, re-run pooling + head under autograd,
+        and take gradients of the logit w.r.t. the feature maps."""
+        import torch
+
+        seq = PairSequence([row], size, train=False, cache=cache,
+                           batch_size=1, shuffle=False)
+        (a, b), _ = seq[0]
+
+        backbone = next(l for l in model.layers if isinstance(l, keras.Model))
+        last_spatial = next(l for l in reversed(backbone.layers)
+                            if len(l.output.shape) == 4)
+        feats = keras.Model(backbone.inputs, last_spatial.output)
+        head = [l for l in model.layers
+                if isinstance(l, (layers.Dropout, layers.Dense,
+                                  layers.LayerNormalization, layers.Activation))]
+
+        maps = [feats(keras.ops.convert_to_tensor(x)).detach().requires_grad_(True)
+                for x in (a, b)]
+        pooled = [m.mean(dim=(1, 2)) for m in maps]         # NHWC global-avg
+        x = torch.cat([pooled[0], pooled[1], pooled[0] - pooled[1]], dim=-1)
+        for layer in head:
+            x = layer(x)
+        x.squeeze().backward()
+
+        cams = []
+        for m in maps:
+            weight = m.grad.mean(dim=(1, 2), keepdim=True)
+            cam = torch.relu((weight * m).sum(-1)).squeeze(0)
+            cams.append((cam / (cam.max() + 1e-8)).detach().cpu().numpy())
+        return a[0].astype(np.uint8), b[0].astype(np.uint8), cams[0], cams[1]
+
     from types import SimpleNamespace
     _KERAS_IMPL = SimpleNamespace(
         train_fold=k_train_fold, load_ensemble=k_load_ensemble,
-        pair_prob=k_pair_prob,
+        pair_prob=k_pair_prob, grad_cam=k_grad_cam,
     )
     return _KERAS_IMPL
 
@@ -486,6 +610,33 @@ def cmd_train(args):
 
     rows = load_pairs(args.root, reverse_positives=not args.no_reverse,
                       identity_negatives=args.identity_negatives)
+
+    if args.challenge_root:
+        challenge = load_pairs(args.challenge_root,
+                               reverse_positives=not args.no_reverse,
+                               identity_negatives=args.identity_negatives)
+        # Same physical location must stay one scene for fold grouping:
+        # match challenge scenes to training scenes by their base name.
+        by_base = {r["scene"].split("/")[-1]: r["scene"] for r in rows}
+        unmatched = set()
+        for r in challenge:
+            base = r["scene"].split("/")[-1]
+            if base in by_base:
+                r["scene"] = by_base[base]
+            else:
+                unmatched.add(r["scene"])
+                r["scene"] = f"challenge/{r['scene']}"
+        rows += challenge
+        merged = {r["scene"].split("/")[-1] for r in challenge} - {
+            s.split("/")[-1] for s in unmatched}
+        print(f"challenge root: +{len(challenge)} rows "
+              f"({len(merged)} scenes merged into training scenes, "
+              f"{len(unmatched)} standalone)")
+        for s in sorted(unmatched):
+            print(f"  note: challenge scene {s} matches no training scene -- "
+                  f"if it is the same physical location under another name, "
+                  f"folds may leak it")
+
     cache = ImageCache(args.cache_side).warm(rows) if args.cache else None
     print()
 
@@ -610,6 +761,33 @@ def cmd_evaluate(args):
         print(f"  {kind:11s} p={p[i]:.3f} (thr {thr:.3f})  "
               f"{r['scene']}/{r['pair']}  items: {items}")
 
+    if args.viz or args.viz_all:
+        folder = Path(args.viz or "viz")
+        folder.mkdir(parents=True, exist_ok=True)
+        # CAMs come from the first ensemble member (a CAM of an average of
+        # models is not well defined); probabilities shown are the ensemble's
+        model0, size0, _ = models[0]
+        if args.keras:
+            impl = keras_impl()
+            cam_fn = lambda row: impl.grad_cam(model0, row, size0, cache)
+        else:
+            device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+            cam_fn = lambda row: torch_grad_cam(model0, row, size0, device, cache)
+        chosen = range(len(rows)) if args.viz_all else failures
+        for i in chosen:
+            r = rows[i]
+            pred, truth = p[i] > thr, y[i] == 1
+            verdict = ("ok" if pred == truth
+                       else "MISSED" if truth else "FALSE_ALARM")
+            before_rgb, after_rgb, cam_a, cam_b = cam_fn(r)
+            caption = (f"{r['scene']}/{r['pair']}  p={p[i]:.3f} thr={thr:.3f}  "
+                       f"pred={'missing' if pred else 'no change'}  "
+                       f"truth={'missing' if truth else 'no change'}  [{verdict}]")
+            name = f"{verdict}__{r['scene'].replace('/', '_')}__{r['pair']}.jpg"
+            save_cam_panel(folder / name, before_rgb, after_rgb,
+                           cam_a, cam_b, caption)
+        print(f"saved {len(list(chosen))} grad-cam panels to {folder}/")
+
 
 # --------------------------------------------------------------------------- #
 def load_config(path):
@@ -647,6 +825,11 @@ def main():
 
     t = sub.add_parser("train", parents=[backend])
     t.add_argument("--root", default="data")
+    t.add_argument("--challenge-root", "--challenge_root", default=None,
+                   help="extra folder of harder training pairs (e.g. "
+                        "../somethings_missing_here/challenging/training); "
+                        "scenes matching a training scene by name share its "
+                        "fold")
     t.add_argument("--backbone", default="resnet18",
                    help="timm model name (torch only; keras always uses "
                         "EfficientNetB0)")
@@ -654,6 +837,10 @@ def main():
     t.add_argument("--epochs", type=int, default=60)
     t.add_argument("--freeze-epochs", type=int, default=10)
     t.add_argument("--patience", type=int, default=15)
+    t.add_argument("--metric", choices=["auc", "acc"], default="auc",
+                   help="validation metric for epoch selection and early "
+                        "stopping; acc also stores the accuracy-maximizing "
+                        "threshold instead of Youden's J")
     t.add_argument("--bs", type=int, default=16)
     t.add_argument("--dropout", type=float, default=0.4)
     t.add_argument("--height", type=int, default=256)
@@ -685,6 +872,11 @@ def main():
                    help="checkpoint glob (default: fold*.pt / kfold*.keras)")
     e.add_argument("--cache", action="store_true")
     e.add_argument("--cache-side", type=int, default=640)
+    e.add_argument("--viz", default=None, metavar="FOLDER",
+                   help="save grad-cam panels for failed pairs to FOLDER")
+    e.add_argument("--viz-all", action="store_true",
+                   help="visualize every pair, not just failures "
+                        "(default folder: viz)")
     e.set_defaults(func=cmd_evaluate)
 
     # --config: pre-scan argv, then install config values as parser defaults
