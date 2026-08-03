@@ -41,11 +41,13 @@ def main() -> None:
     subprocess.run([python, "-m", "pip", "install", "--upgrade", "pip"],
                    check=True)
 
-    # On Windows with an NVIDIA GPU, install CUDA torch first so the
-    # requirements step's "torch>=2.0" is already satisfied by it.
+    # On Windows with an NVIDIA GPU, install CUDA torch (and its matching
+    # torchvision -- a PyPI CPU torchvision on top of CUDA torch fails with
+    # "operator torchvision::nms does not exist") before the requirements
+    # step, so their pins are already satisfied.
     if sys.platform == "win32" and shutil.which("nvidia-smi"):
-        print("NVIDIA GPU detected -- installing CUDA-enabled torch")
-        subprocess.run([python, "-m", "pip", "install", "torch",
+        print("NVIDIA GPU detected -- installing CUDA-enabled torch + torchvision")
+        subprocess.run([python, "-m", "pip", "install", "torch", "torchvision",
                         "--index-url", WINDOWS_CUDA_INDEX], check=True)
     subprocess.run([python, "-m", "pip", "install", "-r",
                     str(ROOT / "requirements.txt")], check=True)
