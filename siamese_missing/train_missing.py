@@ -54,11 +54,15 @@ def seed_all(seed):
 # --------------------------------------------------------------------------- #
 # augmentation (shared by both implementations)
 # --------------------------------------------------------------------------- #
-def build_transforms(size, train):
+def build_transforms(size, train, flip=False):
     """
     geometric   -> identical on both images (one shared transform)
     photometric -> independent per image (teaches 'lighting change != item gone')
     jitter      -> small extra warp on `after` only, for registration slack
+
+    flip=True adds a horizontal flip (and its test-time counterpart, see
+    pair_prob). Off by default: left-right orientation is meaningful in
+    these scenes, and mirroring can cost more than the 2x data gains.
     """
     h, w = size
     shared = [
@@ -67,11 +71,10 @@ def build_transforms(size, train):
         A.CenterCrop(h, w),          # guarantees an exact, collatable shape
     ]
     if train:
-        shared += [
-            A.HorizontalFlip(p=0.5),
-            A.Affine(scale=(0.9, 1.1), translate_percent=0.05,
-                     rotate=(-7, 7), p=0.7),
-        ]
+        if flip:
+            shared.append(A.HorizontalFlip(p=0.5))
+        shared.append(A.Affine(scale=(0.9, 1.1), translate_percent=0.05,
+                               rotate=(-7, 7), p=0.7))
     shared = A.Compose(shared, additional_targets={"image2": "image"})
     jitter = A.Affine(translate_percent=0.02, rotate=(-2, 2), p=0.5) if train else None
     photo = A.Compose([
@@ -91,21 +94,88 @@ def read_image(path, cache=None):
     return cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
 
 
+def align_rows(rows, cache=None, max_side=640, verbose=True):
+    """Precompute ECC-aligned versions of every unique (before, after) pair
+    using align_images.py's logic: warp before into after's frame and crop
+    both to their largest shared valid rectangle.
+
+    Returns {(before_path, after_path): (before_rgb, after_rgb)}. Reversed
+    rows reuse the same entry swapped; identity rows need no alignment.
+    Pairs where ECC fails to converge fall back to their unaligned images.
+    """
+    import contextlib
+    import io
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    try:
+        from align_images import align_to_reference, largest_valid_rectangle
+    except ImportError:
+        raise SystemExit(
+            "error: --align needs align_images.py from the project root")
+
+    def load(path):
+        img = read_image(path, cache)
+        h, w = img.shape[:2]
+        s = max_side / max(h, w)
+        if s < 1.0:
+            img = cv2.resize(img, (round(w * s), round(h * s)),
+                             interpolation=cv2.INTER_AREA)
+        return img
+
+    pairs = sorted({(r["before"], r["after"]) for r in rows
+                    if not r.get("reversed") and not r.get("identity")})
+    aligned, failed = {}, 0
+    for i, (before_path, after_path) in enumerate(pairs):
+        before, after = load(before_path), load(after_path)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                warped, mask = align_to_reference(
+                    before, after, alignment_max_size=384)
+            left, top, right, bottom = largest_valid_rectangle(mask)
+            aligned[(before_path, after_path)] = (
+                np.ascontiguousarray(warped[top:bottom, left:right]),
+                np.ascontiguousarray(after[top:bottom, left:right]))
+        except (ValueError, cv2.error):
+            failed += 1
+        if verbose and (i + 1) % 25 == 0:
+            print(f"\r  aligning pairs: {i + 1}/{len(pairs)}",
+                  end="" if sys.stdout.isatty() else "\n", flush=True)
+    if verbose:
+        end = "\r" + " " * 40 + "\r" if sys.stdout.isatty() else ""
+        print(f"{end}aligned {len(aligned)}/{len(pairs)} pairs"
+              + (f" ({failed} failed, kept unaligned)" if failed else ""))
+    return aligned
+
+
 # --------------------------------------------------------------------------- #
 # dataset (torch)
 # --------------------------------------------------------------------------- #
+def pair_images(r, cache=None, aligned=None):
+    """The pair's two RGB arrays, preferring precomputed aligned versions."""
+    if aligned:
+        entry = aligned.get((r["before"], r["after"]))
+        if entry is not None:
+            return entry
+        entry = aligned.get((r["after"], r["before"]))
+        if entry is not None:                    # reversed row: swap back
+            return entry[1], entry[0]
+    return (read_image(r["before"], cache), read_image(r["after"], cache))
+
+
 class PairSet(Dataset):
-    def __init__(self, rows, size=(256, 256), train=True, cache=None):
+    def __init__(self, rows, size=(256, 256), train=True, cache=None,
+                 aligned=None, flip=False):
         self.rows, self.train, self.cache = rows, train, cache
-        self.shared, self.jitter, self.photo = build_transforms(size, train)
+        self.aligned = aligned
+        self.shared, self.jitter, self.photo = build_transforms(
+            size, train, flip)
 
     def __len__(self):
         return len(self.rows)
 
     def __getitem__(self, i):
         r = self.rows[i]
-        out = self.shared(image=read_image(r["before"], self.cache),
-                          image2=read_image(r["after"], self.cache))
+        before, after = pair_images(r, self.cache, self.aligned)
+        out = self.shared(image=before, image2=after)
         a, b = out["image"], out["image2"]
         if self.jitter is not None:
             b = self.jitter(image=b)["image"]
@@ -245,13 +315,13 @@ def save_cam_panel(path, before_rgb, after_rgb, cam_before, cam_after, caption):
     cv2.imwrite(str(path), np.vstack([strip, panel])[..., ::-1])
 
 
-def torch_grad_cam(model, row, size, device, cache=None):
+def torch_grad_cam(model, row, size, device, cache=None, aligned=None):
     """Grad-CAM of the 'missing' logit at the encoder's last spatial layer.
 
     Returns (before_rgb, after_rgb, cam_before, cam_after): the network's
     actual inputs (denormalized) and one [0,1] heatmap per branch.
     """
-    ds = PairSet([row], size, train=False, cache=cache)
+    ds = PairSet([row], size, train=False, cache=cache, aligned=aligned)
     a, b, _ = ds[0]
     a, b = a[None].to(device), b[None].to(device)
 
@@ -294,14 +364,17 @@ def torch_grad_cam(model, row, size, device, cache=None):
 # --------------------------------------------------------------------------- #
 # training (torch)
 # --------------------------------------------------------------------------- #
-def train_fold(tr_rows, va_rows, args, device, fold, cache):
+def train_fold(tr_rows, va_rows, args, device, fold, cache, aligned=None):
     seed_all(args.seed + fold)
     size = (args.height, args.width)
+    flip = args.flip
     workers = 0 if cache is not None else args.workers
 
-    tr = DataLoader(PairSet(tr_rows, size, True, cache), batch_size=args.bs,
+    tr = DataLoader(PairSet(tr_rows, size, True, cache, aligned, flip),
+                    batch_size=args.bs,
                     shuffle=True, num_workers=workers)
-    va = DataLoader(PairSet(va_rows, size, False, cache), batch_size=args.bs,
+    va = DataLoader(PairSet(va_rows, size, False, cache, aligned, flip),
+                    batch_size=args.bs,
                     num_workers=workers)
 
     model = SiameseBool(args.backbone, p_drop=args.dropout).to(device)
@@ -383,21 +456,24 @@ def keras_impl():
         0-255 float here."""
 
         def __init__(self, rows, size=(256, 256), train=True, cache=None,
-                     batch_size=16, shuffle=None, seed=0, **kwargs):
+                     batch_size=16, shuffle=None, seed=0, aligned=None,
+                     flip=False, **kwargs):
             super().__init__(**kwargs)
             self.rows = list(rows)
             self.cache = cache
+            self.aligned = aligned
             self.batch_size = batch_size
             self.shuffle = train if shuffle is None else shuffle
             self.rng = np.random.default_rng(seed)
             self.order = np.arange(len(self.rows))
-            self.shared, self.jitter, self.photo = build_transforms(size, train)
+            self.shared, self.jitter, self.photo = build_transforms(
+                size, train, flip)
             if self.shuffle:
                 self.rng.shuffle(self.order)
 
         def _sample(self, r):
-            out = self.shared(image=read_image(r["before"], self.cache),
-                              image2=read_image(r["after"], self.cache))
+            before, after = pair_images(r, self.cache, self.aligned)
+            out = self.shared(image=before, image2=after)
             a, b = out["image"], out["image2"]
             if self.jitter is not None:
                 b = self.jitter(image=b)["image"]
@@ -472,13 +548,15 @@ def keras_impl():
             ys.append(y)
         return np.concatenate(ps), np.concatenate(ys)
 
-    def k_train_fold(tr_rows, va_rows, args, fold, cache):
+    def k_train_fold(tr_rows, va_rows, args, fold, cache, aligned=None):
         keras.utils.set_random_seed(args.seed + fold)
         size = (args.height, args.width)
+        flip = args.flip
 
         tr = PairSequence(tr_rows, size, True, cache, args.bs,
-                          seed=args.seed + fold)
-        va = PairSequence(va_rows, size, False, cache, args.bs, shuffle=False)
+                          seed=args.seed + fold, aligned=aligned, flip=flip)
+        va = PairSequence(va_rows, size, False, cache, args.bs,
+                          shuffle=False, aligned=aligned, flip=flip)
 
         model = build_model(size, p_drop=args.dropout)
         model.backbone.trainable = False   # frozen BN stays in inference mode
@@ -538,25 +616,27 @@ def keras_impl():
                            tuple(meta["size"]), meta["threshold"]))
         return models
 
-    def k_pair_prob(model, before, after, size, cache=None):
+    def k_pair_prob(model, before, after, size, cache=None, aligned=None,
+                    flip=False):
         seq = PairSequence([{"before": before, "after": after, "y": 0.0}],
                            size, train=False, cache=cache, batch_size=1,
-                           shuffle=False)
+                           shuffle=False, aligned=aligned)
         (a, b), _ = seq[0]
         # hflip TTA: cheap, reduces variance on a small model
-        logits = [model.predict_on_batch((a, b)).squeeze(),
-                  model.predict_on_batch((np.flip(a, 2).copy(),
-                                          np.flip(b, 2).copy())).squeeze()]
+        logits = [model.predict_on_batch((a, b)).squeeze()]
+        if flip:
+            logits.append(model.predict_on_batch(
+                (np.flip(a, 2).copy(), np.flip(b, 2).copy())).squeeze())
         return float(1.0 / (1.0 + np.exp(-np.mean(logits))))
 
-    def k_grad_cam(model, row, size, cache=None):
+    def k_grad_cam(model, row, size, cache=None, aligned=None):
         """Grad-CAM under the torch backend: split the model at the
         backbone's last spatial layer, re-run pooling + head under autograd,
         and take gradients of the logit w.r.t. the feature maps."""
         import torch
 
         seq = PairSequence([row], size, train=False, cache=cache,
-                           batch_size=1, shuffle=False)
+                           batch_size=1, shuffle=False, aligned=aligned)
         (a, b), _ = seq[0]
 
         backbone = next(l for l in model.layers if isinstance(l, keras.Model))
@@ -638,17 +718,19 @@ def cmd_train(args):
                   f"folds may leak it")
 
     cache = ImageCache(args.cache_side).warm(rows) if args.cache else None
+    aligned = align_rows(rows, cache) if args.align else None
     print()
 
     results = []
-    for k, (tr_rows, va_rows) in enumerate(scene_folds(rows, args.folds, args.seed)):
+    for k, (tr_rows, va_rows) in enumerate(
+            scene_folds(rows, args.folds, args.seed, args.val_fraction)):
         # identity negatives are train-only: without augmentation they are
         # pixel-identical and would flatter validation
         va_rows = [r for r in va_rows if not r.get("identity", False)]
         if args.keras:
-            r = impl.train_fold(tr_rows, va_rows, args, k, cache)
+            r = impl.train_fold(tr_rows, va_rows, args, k, cache, aligned)
         else:
-            r = train_fold(tr_rows, va_rows, args, device, k, cache)
+            r = train_fold(tr_rows, va_rows, args, device, k, cache, aligned)
         results.append(r)
         print(f"fold {k}: {r['n_val']:3d} val pairs | AUC {r['auc']:.3f} | "
               f"acc {r['acc']:.3f} | TP {r['tp']} FP {r['fp']} FN {r['fn']} "
@@ -684,26 +766,30 @@ def load_ensemble(ckpt_glob, device):
 
 
 @torch.no_grad()
-def pair_prob(model, before, after, size, device, cache=None):
+def pair_prob(model, before, after, size, device, cache=None, aligned=None,
+              flip=False):
     ds = PairSet([{"before": before, "after": after, "y": 0.0}],
-                 size, train=False, cache=cache)
+                 size, train=False, cache=cache, aligned=aligned)
     a, b, _ = ds[0]
     a, b = a[None].to(device), b[None].to(device)
     # hflip TTA: cheap, reduces variance on a small model
-    logits = torch.stack([model(a, b),
-                          model(torch.flip(a, [-1]), torch.flip(b, [-1]))])
-    return float(torch.sigmoid(logits.mean()).item())
+    logits = [model(a, b)]
+    if flip:
+        logits.append(model(torch.flip(a, [-1]), torch.flip(b, [-1])))
+    return float(torch.sigmoid(torch.stack(logits).mean()).item())
 
 
-def make_pair_scorer(args, cache=None):
+def make_pair_scorer(args, cache=None, aligned=None):
     """Return (models, score(model, size, before, after)) for either backend."""
     if args.keras:
         impl = keras_impl()
         models = impl.load_ensemble(args.ckpt)
-        return models, lambda m, size, bf, af: impl.pair_prob(m, bf, af, size, cache)
+        return models, lambda m, size, bf, af: impl.pair_prob(
+            m, bf, af, size, cache, aligned, args.flip)
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     models = load_ensemble(args.ckpt, device)
-    return models, lambda m, size, bf, af: pair_prob(m, bf, af, size, device, cache)
+    return models, lambda m, size, bf, af: pair_prob(
+        m, bf, af, size, device, cache, aligned, args.flip)
 
 
 def cmd_predict(args):
@@ -731,7 +817,8 @@ def cmd_evaluate(args):
     # natural pairs only: reversals would flatter the score
     rows = load_pairs(args.root, reverse_positives=False)
     cache = ImageCache(args.cache_side).warm(rows) if args.cache else None
-    models, score = make_pair_scorer(args, cache)
+    aligned = align_rows(rows, cache) if args.align else None
+    models, score = make_pair_scorer(args, cache, aligned)
     print()
 
     y = np.array([r["y"] for r in rows])
@@ -769,10 +856,10 @@ def cmd_evaluate(args):
         model0, size0, _ = models[0]
         if args.keras:
             impl = keras_impl()
-            cam_fn = lambda row: impl.grad_cam(model0, row, size0, cache)
+            cam_fn = lambda row: impl.grad_cam(model0, row, size0, cache, aligned)
         else:
             device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-            cam_fn = lambda row: torch_grad_cam(model0, row, size0, device, cache)
+            cam_fn = lambda row: torch_grad_cam(model0, row, size0, device, cache, aligned)
         chosen = range(len(rows)) if args.viz_all else failures
         for i in chosen:
             r = rows[i]
@@ -817,6 +904,11 @@ def main():
                          help="cuda | cpu | mps (torch implementation only)")
     backend.add_argument("--config", default=None,
                          help="JSON file with flag values (CLI flags override)")
+    backend.add_argument("--flip", action="store_true",
+                         help="enable horizontal flips: adds the shared flip to "
+                              "training augmentation and a flipped pass to "
+                              "test-time averaging (off by default; use the "
+                              "same setting for train and inference)")
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=None,
@@ -833,7 +925,12 @@ def main():
     t.add_argument("--backbone", default="resnet18",
                    help="timm model name (torch only; keras always uses "
                         "EfficientNetB0)")
-    t.add_argument("--folds", type=int, default=5)
+    t.add_argument("--folds", type=int, default=5,
+                   help="cross-validation folds; 1 = single train/val split "
+                        "(see --val-fraction), training one model")
+    t.add_argument("--val-fraction", type=float, default=0.2,
+                   help="with --folds 1: fraction of rows held out (whole "
+                        "scenes) for validation (default: 0.15)")
     t.add_argument("--epochs", type=int, default=60)
     t.add_argument("--freeze-epochs", type=int, default=10)
     t.add_argument("--patience", type=int, default=15)
@@ -850,6 +947,9 @@ def main():
                    help="checkpoint prefix (default: fold / kfold)")
     t.add_argument("--workers", type=int, default=2)
     t.add_argument("--cache", action="store_true", help="decode images once into RAM")
+    t.add_argument("--align", action="store_true",
+                   help="ECC-align each pair (align_images.py logic) before "
+                        "training; one-off precompute, ~1s per pair")
     t.add_argument("--cache-side", type=int, default=640)
     t.add_argument("--no-reverse", action="store_true",
                    help="skip synthesised reversed negatives")
@@ -871,6 +971,9 @@ def main():
     e.add_argument("--ckpt", default=None,
                    help="checkpoint glob (default: fold*.pt / kfold*.keras)")
     e.add_argument("--cache", action="store_true")
+    e.add_argument("--align", action="store_true",
+                   help="ECC-align each pair before evaluation (use when the "
+                        "model was trained with --align)")
     e.add_argument("--cache-side", type=int, default=640)
     e.add_argument("--viz", default=None, metavar="FOLDER",
                    help="save grad-cam panels for failed pairs to FOLDER")
