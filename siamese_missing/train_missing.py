@@ -707,12 +707,12 @@ def cmd_train(args):
         device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
         print(f"device: {device}\n")
 
-    rows = load_pairs(args.root, reverse_positives=not args.no_reverse,
+    rows = load_pairs(args.root, reverse_positives=args.reverse,
                       identity_negatives=args.identity_negatives)
 
     if args.challenge_root:
         challenge = load_pairs(args.challenge_root,
-                               reverse_positives=not args.no_reverse,
+                               reverse_positives=args.reverse,
                                identity_negatives=args.identity_negatives)
         # Same physical location must stay one scene for fold grouping:
         # match challenge scenes to training scenes by their base name.
@@ -977,8 +977,9 @@ def main():
                    help="ECC-align each pair (align_images.py logic) before "
                         "training; one-off precompute, ~1s per pair")
     t.add_argument("--cache-side", type=int, default=640)
-    t.add_argument("--no-reverse", action="store_true",
-                   help="skip synthesised reversed negatives")
+    t.add_argument("--reverse", action="store_true",
+                   help="add a swapped-order negative per positive (a removal "
+                        "read backwards is an addition); off by default")
     t.add_argument("--identity-negatives", action="store_true",
                    help="add same-photo no-change negatives (for datasets "
                         "with no natural negative pairs)")

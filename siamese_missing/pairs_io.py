@@ -1,13 +1,14 @@
 """
 pairs_io.py
 Read the scene/pair folder tree straight into memory: no manifest file, no
-generated folders. Positive pairs are reversed on the fly to synthesise hard
-negatives (removing an item, read backwards, is adding one).
+generated folders. Positive pairs can optionally be reversed on the fly to
+synthesise hard negatives (removing an item, read backwards, is adding one).
 
     from pairs_io import load_pairs, ImageCache
 
-    rows = load_pairs("data")                 # includes reversals
-    cache = ImageCache(max_side=640)          # decode each JPEG once
+    rows = load_pairs("data")                       # pairs as labelled
+    rows = load_pairs("data", reverse_positives=True)   # + reversals
+    cache = ImageCache(max_side=640)                # decode each JPEG once
 
 Because a reversed pair points at the SAME two files as its source, the cache
 makes reversal free: no extra decode, no extra pixels held in RAM.
@@ -46,15 +47,18 @@ def _is_positive(meta):
     return m is True or (isinstance(m, list) and len(m) > 0)
 
 
-def load_pairs(root, reverse_positives=True, identity_negatives=False, verbose=True):
+def load_pairs(root, reverse_positives=False, identity_negatives=False,
+               verbose=True):
     """
     Returns a list of dicts:
         {before, after, y, scene, items, reversed, identity, pair}
 
-    `y` is 1.0 if something went missing. Reversed rows carry y=0.0 and keep
-    the same `scene`, so scene-grouped CV keeps a reversal in the same fold as
-    its source -- otherwise the model sees the same photographs in train and
-    val and validation becomes meaningless.
+    `y` is 1.0 if something went missing. reverse_positives (off by default)
+    adds, per positive, a y=0.0 row with the two photos swapped: a removal
+    read backwards is an addition. Reversed rows keep the same `scene`, so
+    scene-grouped CV keeps a reversal in the same fold as its source --
+    otherwise the model sees the same photographs in train and val and
+    validation becomes meaningless.
 
     identity_negatives adds one y=0.0 row per positive that points the same
     file at both slots (alternating before/after as the source). Train-time
