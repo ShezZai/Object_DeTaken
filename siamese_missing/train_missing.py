@@ -307,6 +307,47 @@ def epoch_progress_done():
         print("\r" + " " * 100 + "\r", end="", flush=True)
 
 
+# fixed per-fold line colors (colorblind-checked order; folds past 8 go gray
+# rather than reusing a hue that already names another fold)
+FOLD_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
+               "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
+
+
+def save_history_graph(path, results):
+    """Per-epoch validation AUC and accuracy, one panel per metric and one
+    line per fold; the dot on each line marks the epoch whose checkpoint was
+    kept. Accuracy is measured at each epoch's own selected threshold."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("warning: --graph needs matplotlib "
+              "(pip install matplotlib); skipping graph")
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), sharex=True, sharey=True)
+    for ax, key, title in zip(axes, ("auc", "acc"),
+                              ("validation AUC", "validation accuracy")):
+        for k, r in enumerate(results):
+            curve = [h[key] for h in r["history"]]
+            color = FOLD_COLORS[k] if k < len(FOLD_COLORS) else "#8a8a86"
+            ax.plot(range(1, len(curve) + 1), curve, color=color,
+                    linewidth=2, label=f"fold {k}")
+            if 0 <= r["epoch"] < len(curve):
+                ax.plot(r["epoch"] + 1, curve[r["epoch"]], "o",
+                        color=color, markersize=6)
+        ax.set_title(title, fontsize=11)
+        ax.set_xlabel("epoch")
+        ax.grid(axis="y", color="#000000", alpha=0.08, linewidth=0.8)
+        ax.spines[["top", "right"]].set_visible(False)
+    axes[0].legend(frameon=False, fontsize=9)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"training curves: {path}")
+
+
 # --------------------------------------------------------------------------- #
 # grad-cam visualization
 # --------------------------------------------------------------------------- #
@@ -400,6 +441,7 @@ def train_fold(tr_rows, va_rows, args, device, fold, cache, aligned=None):
 
     best = {"score": -1.0, "auc": -1.0, "thr": 0.5, "state": None, "epoch": -1}
     patience = 0
+    history = []
 
     for epoch in range(args.epochs):
         if epoch == args.freeze_epochs:          # unfreeze, low LR on the backbone
@@ -419,6 +461,8 @@ def train_fold(tr_rows, va_rows, args, device, fold, cache, aligned=None):
         p, y = probs_and_labels(model, va, device)
         auc = roc_auc_score(y, p) if len(set(y)) > 1 else float("nan")
         score, thr = val_metric(args.metric, y, p)
+        history.append({"auc": float(auc),
+                        "acc": float(((p > thr) == (y == 1)).mean())})
 
         if score > best["score"]:
             best = {"score": float(score), "auc": float(auc), "thr": thr,
@@ -446,7 +490,7 @@ def train_fold(tr_rows, va_rows, args, device, fold, cache, aligned=None):
                 "activation": args.activation}, path)
     return {"auc": best["auc"], "acc": acc, "epoch": best["epoch"],
             "tp": tp, "fp": fp, "fn": fn, "tn": tn, "path": path,
-            "n_val": len(y)}
+            "n_val": len(y), "history": history}
 
 
 # --------------------------------------------------------------------------- #
@@ -583,6 +627,7 @@ def keras_impl():
         best = {"score": -1.0, "auc": -1.0, "thr": 0.5,
                 "weights": None, "epoch": -1}
         patience = 0
+        history = []
 
         for epoch in range(args.epochs):
             if epoch == args.freeze_epochs:  # unfreeze, low LR on everything
@@ -594,6 +639,8 @@ def keras_impl():
             p, y = k_probs_and_labels(model, va)
             auc = roc_auc_score(y, p) if len(set(y)) > 1 else float("nan")
             score, thr = val_metric(args.metric, y, p)
+            history.append({"auc": float(auc),
+                            "acc": float(((p > thr) == (y == 1)).mean())})
 
             if score > best["score"]:
                 best = {"score": float(score), "auc": float(auc), "thr": thr,
@@ -622,7 +669,7 @@ def keras_impl():
         }))
         return {"auc": best["auc"], "acc": acc, "epoch": best["epoch"],
                 "tp": tp, "fp": fp, "fn": fn, "tn": tn, "path": path,
-                "n_val": len(y)}
+                "n_val": len(y), "history": history}
 
     def k_load_ensemble(ckpt_glob):
         paths = sorted(glob.glob(ckpt_glob))
@@ -758,6 +805,9 @@ def cmd_train(args):
     aucs = np.array([r["auc"] for r in results])
     accs = np.array([r["acc"] for r in results])
     suffix = "keras" if args.keras else "pt"
+    if args.graph:
+        save_history_graph(args.graph if isinstance(args.graph, str)
+                           else f"{args.prefix}curves.png", results)
     print(f"\nAUC {aucs.mean():.3f} +/- {aucs.std():.3f}"
           f"   acc {accs.mean():.3f} +/- {accs.std():.3f}")
     print(f"checkpoints: {args.prefix}0.{suffix} ... "
@@ -977,6 +1027,11 @@ def main():
                    help="ECC-align each pair (align_images.py logic) before "
                         "training; one-off precompute, ~1s per pair")
     t.add_argument("--cache-side", type=int, default=640)
+    t.add_argument("--graph", nargs="?", const=True, default=None,
+                   metavar="FILE",
+                   help="plot per-epoch validation AUC and accuracy for every "
+                        "fold to FILE (default: <prefix>curves.png); needs "
+                        "matplotlib")
     t.add_argument("--reverse", action="store_true",
                    help="add a swapped-order negative per positive (a removal "
                         "read backwards is an addition); off by default")
