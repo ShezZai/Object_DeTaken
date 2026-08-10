@@ -42,13 +42,15 @@ training/
 │           └── label.json   {"missing": true, "items": ["<removed object>"]}
 │                            or {"missing": false, "items": []} for no-change pairs
 └── Remove360_based/         pairs derived from Remove360 (see below)
-    └── <scene>/             backyard_big_tree, backyard_bricks, backyard_stones,
-        └── pair_<nn>/       backyard_toys, bedroom, living-room, office, park,
-                             stairwell
+    └── <scene>/             backyard_big_tree, backyard_stones, park,
+        └── pair_<nn>/       stairwell
 test/
-└── DeTaken/                 held-out scenes, never in training
-    └── test_<scene>/        test_broom, test_chair, test_class_01..05,
-        └── pair_<nn>/       test_phone, test_stroller, ...
+├── DeTaken/                 held-out scenes, never in training
+│   └── test_<scene>/        test_class_01, test_class_02, test_class_03
+│       └── pair_<nn>/
+└── Remove360_based/         held-out Remove360 scenes, never in training
+    └── test_<scene>/        test_backyard_bricks, test_backyard_toys,
+        └── pair_<nn>/       test_bedroom, test_living-room, test_office
 challenging/                 harder cases: swaps, replacements, rearrangements
 ├── training/
 │   └── <scene>/             same scene names as training/DeTaken
@@ -57,15 +59,29 @@ challenging/                 harder cases: swaps, replacements, rearrangements
     └── pair_<nn>/           held-out challenging pairs (flat)
 ```
 
-Overview (crop-shift = synthetic no-change pairs, see below):
+**Size in pairs: 350 training and 116 test** (across 32 and 8 scenes
+respectively), plus 93 challenging pairs (81 training, 12 test) — 559 pairs
+in total. Breakdown (crop-shift = synthetic no-change pairs, see below):
 
 | split | collection | scenes | pairs | positive | negative | of which crop-shift |
 |---|---|---|---|---|---|---|
-| training | DeTaken | 18 | 186 | 74 | 112 | 100 |
-| training | Remove360_based | 9 | 372 | 124 | 248 | 248 |
-| test | DeTaken | 13 | 108 | 51 | 57 | 16 |
+| training | DeTaken | 28 | 254 | 104 | 150 | 116 |
+| training | Remove360_based | 4 | 96 | 48 | 48 | 48 |
+| test | DeTaken | 3 | 40 | 21 | 19 | 0 |
+| test | Remove360_based | 5 | 76 | 76 | 0 | 0 |
 | challenging | training | 17 | 81 | 27 | 54 | 0 |
 | challenging | test | 1 | 12 | 6 | 6 | 0 |
+
+**Test pairs are unmanipulated.** Synthetic pairs are confined to
+`training/`: every pair in `test/` and `challenging/` consists of two
+genuinely captured photographs, with all removals physical — nothing was
+digitally added to, removed from, or composited into any image. Verified
+against the folder tree: no test `label.json` carries a `source` field
+(the marker of a derived pair), the crop-shift count is zero across all
+test splits, and pair folders contain nothing but `before.jpg`,
+`after.jpg`, and `label.json`. The only processing applied to test images
+is the disclosed geometric viewpoint alignment of the `Remove360_based`
+subset (a homography warp and crop — see below).
 
 Negative pairs that were derived rather than photographed carry a `source`
 field in `label.json` documenting what they were built from.
@@ -82,16 +98,18 @@ the "the camera shifted, the scene did not" case a removal detector must not
 mistake for a disappearance.
 
 Two negatives are generated per source pair (one from its `before.jpg`, one
-from its `after.jpg`), the trim is 10–20 px per axis, both crops come out the
-same size, and each carries
+from its `after.jpg`; the `Remove360_based` scenes retain only one of the
+two), the trim is 10–20 px per axis, both crops come out the same size, and
+each carries
 `{"missing": false, "items": [], "source": "crop-shift of <pair>/<file>"}`.
 
 They are cheap and plentiful, but they only vary translation — unlike real
 re-shot no-change pairs, the lighting, focus, and perspective are identical.
 Treat them as a supplement: the `crop-shift` column above shows how much of
-each split's negative set is synthetic, and the held-out `test/` split keeps
-its negatives mostly real so a model that has merely learned "small shift ⇒
-nothing missing" shows up as false alarms.
+each split's negative set is synthetic. Crop-shift pairs exist only in
+`training/` — the `test/` and `challenging/` splits contain none, so a
+model that has merely learned "small shift ⇒ nothing missing" shows up
+there as false alarms.
 
 In `Remove360_based/` pairs (both splits), `before.jpg` is warped into
 `after.jpg`'s camera frame and both images are cropped to their shared valid
@@ -131,22 +149,24 @@ outdoor scenes. Its before and after images are independent captures — they
 are **not** pixel-aligned pairs — so this subset was built by finding and
 aligning the closest matching viewpoints between the two walks.
 
-372 pairs — 124 positives (something was removed) and 248 crop-shift
-negatives — across 9 scenes and 9 removed objects. Remove360's single large
-backyard scene is split into four sub-scenes by area (big tree lawn, brick
-patio, stones, toy corner):
+172 pairs — 124 positives (something was removed) and 48 crop-shift
+negatives — across 9 scenes and 9 removed objects, divided by whole scene
+into `training/` (4 scenes, 96 pairs, one crop-shift negative per positive)
+and the held-out `test/` (5 scenes, 76 pairs, positives only, prefixed
+`test_`). Remove360's single large backyard scene is split into four
+sub-scenes by area (big tree lawn, brick patio, stones, toy corner):
 
 | scene | positive | negative | | removed object | pairs |
 |---|---|---|---|---|---|
-| stairwell | 24 | 48 | | chairs | 36 |
-| backyard_toys | 23 | 46 | | backpack | 24 |
-| living-room | 21 | 42 | | stroller | 16 |
-| backyard_bricks | 16 | 32 | | sofa | 15 |
-| office | 13 | 26 | | deckchair | 11 |
-| backyard_big_tree | 11 | 22 | | bicycle | 10 |
-| park | 10 | 20 | | pillows | 6 |
-| bedroom | 3 | 6 | | table | 3 |
-| backyard_stones | 3 | 6 | | toy-truck | 3 |
+| stairwell | 24 | 24 | | chairs | 36 |
+| test_backyard_toys | 23 | 0 | | backpack | 24 |
+| test_living-room | 21 | 0 | | stroller | 16 |
+| test_backyard_bricks | 16 | 0 | | sofa | 15 |
+| test_office | 13 | 0 | | deckchair | 11 |
+| backyard_big_tree | 11 | 11 | | bicycle | 10 |
+| park | 10 | 10 | | pillows | 6 |
+| test_bedroom | 3 | 0 | | table | 3 |
+| backyard_stones | 3 | 3 | | toy-truck | 3 |
 
 ### How it was generated
 
@@ -178,7 +198,8 @@ patio, stones, toy corner):
    some were deleted by hand; the remaining pairs were renumbered
    contiguously.
 8. **No-change negatives** — this subset's negatives are the crop-shift
-   pairs described above, two per positive. An earlier approach paired
+   pairs described above, kept only in the training scenes (one per
+   positive); the test scenes hold positives only. An earlier approach paired
    same-walk images (two pre-removal frames, or two post-removal frames,
    matched with the same gates as the positives) and a few such pairs may
    remain; their `label.json` `source` field names the two images they came

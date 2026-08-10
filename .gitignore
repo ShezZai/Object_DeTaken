@@ -14,6 +14,11 @@ unique_objects.jpg
 *_aligned.jpg
 *_aligned.png
 
+# generated results
+align_compare_test_results/
+/pairs.txt
+siamese_missing/*.png
+
 # datasets (raw Remove360 download; curated set lives on HF)
 Remove360/
 somethings_missing_here/training/
