@@ -26,6 +26,11 @@ import os
 import sys
 from pathlib import Path
 
+# albumentations 2.x renamed transform arguments and breaks the pipeline
+# below, so requirements pin <2 -- silence its upgrade nag (must be set
+# before the import).
+os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
+
 import albumentations as A
 import cv2
 import numpy as np
@@ -36,6 +41,12 @@ from sklearn.metrics import roc_auc_score, roc_curve
 from torch.utils.data import DataLoader, Dataset
 
 from pairs_io import ImageCache, load_pairs, scene_folds
+
+# head activations shared by both implementations; keras takes the name
+# directly, torch needs the module.
+ACTIVATIONS = {"gelu": nn.GELU, "relu": nn.ReLU, "silu": nn.SiLU,
+               "elu": nn.ELU, "tanh": nn.Tanh,
+               "leaky_relu": nn.LeakyReLU}
 
 MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
@@ -189,7 +200,8 @@ class PairSet(Dataset):
 # model (torch)
 # --------------------------------------------------------------------------- #
 class SiameseBool(nn.Module):
-    def __init__(self, backbone="resnet18", pretrained=True, p_drop=0.4):
+    def __init__(self, backbone="resnet18", pretrained=True, p_drop=0.4,
+                 hidden=128, activation="gelu"):
         super().__init__()
         # ONE encoder called twice == shared weights. That is the siamese part.
         # Not two encoders: (1) the head subtracts features, which only means
@@ -203,10 +215,11 @@ class SiameseBool(nn.Module):
         # LayerNorm not BatchNorm: batches are small, so batch statistics are
         # noisy and batch-size dependent.
         self.head = nn.Sequential(
-            nn.Dropout(0.2),
-            nn.Linear(3 * d, 128), nn.LayerNorm(128), nn.GELU(),
             nn.Dropout(p_drop),
-            nn.Linear(128, 1),
+            nn.Linear(3 * d, hidden), nn.LayerNorm(hidden),
+            ACTIVATIONS[activation](),
+            nn.Dropout(p_drop),
+            nn.Linear(hidden, 1),
         )
         self.enc_frozen = False
 
@@ -377,7 +390,9 @@ def train_fold(tr_rows, va_rows, args, device, fold, cache, aligned=None):
                     batch_size=args.bs,
                     num_workers=workers)
 
-    model = SiameseBool(args.backbone, p_drop=args.dropout).to(device)
+    model = SiameseBool(args.backbone, p_drop=args.dropout,
+                        hidden=args.hidden,
+                        activation=args.activation).to(device)
     model.freeze_encoder(True)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
                             lr=1e-3, weight_decay=1e-4)
@@ -427,7 +442,8 @@ def train_fold(tr_rows, va_rows, args, device, fold, cache, aligned=None):
     path = f"{args.prefix}{fold}.pt"
     torch.save({"model": best["state"], "backbone": args.backbone, "size": size,
                 "threshold": best["thr"], "val_auc": best["auc"],
-                "dropout": args.dropout}, path)
+                "dropout": args.dropout, "hidden": args.hidden,
+                "activation": args.activation}, path)
     return {"auc": best["auc"], "acc": acc, "epoch": best["epoch"],
             "tp": tp, "fp": fp, "fn": fn, "tn": tn, "path": path,
             "n_val": len(y)}
@@ -497,7 +513,8 @@ def keras_impl():
             if self.shuffle:
                 self.rng.shuffle(self.order)
 
-    def build_model(size=(256, 256), pretrained=True, p_drop=0.4):
+    def build_model(size=(256, 256), pretrained=True, p_drop=0.4,
+                    hidden=128, activation="gelu"):
         h, w = size
         # ONE backbone applied to both inputs == shared weights (the siamese
         # part). In the functional API, calling the same layer instance twice
@@ -521,12 +538,12 @@ def keras_impl():
         # abs() would be symmetric and could not tell the two apart, which is
         # exactly the distinction the reversed-pair negatives train.
         x = layers.Concatenate()([fa, fb, layers.Subtract()([fa, fb])])
-        x = layers.Dropout(0.2)(x)
-        x = layers.Dense(128)(x)
+        x = layers.Dropout(p_drop)(x)
+        x = layers.Dense(hidden)(x)
         # LayerNorm not BatchNorm: batches are small, so batch statistics are
         # noisy and batch-size dependent.
         x = layers.LayerNormalization()(x)
-        x = layers.Activation("gelu")(x)
+        x = layers.Activation(activation)(x)
         x = layers.Dropout(p_drop)(x)
         out = layers.Dense(1, name="logit")(x)
         model = keras.Model([inp_a, inp_b], out)
@@ -558,7 +575,8 @@ def keras_impl():
         va = PairSequence(va_rows, size, False, cache, args.bs,
                           shuffle=False, aligned=aligned, flip=flip)
 
-        model = build_model(size, p_drop=args.dropout)
+        model = build_model(size, p_drop=args.dropout,
+                            hidden=args.hidden, activation=args.activation)
         model.backbone.trainable = False   # frozen BN stays in inference mode
         compile_model(model, lr=1e-3)
 
@@ -599,7 +617,8 @@ def keras_impl():
         Path(f"{args.prefix}{fold}.json").write_text(json.dumps({
             "size": [args.height, args.width], "threshold": best["thr"],
             "val_auc": best["auc"], "backbone": "efficientnetb0",
-            "dropout": args.dropout,
+            "dropout": args.dropout, "hidden": args.hidden,
+            "activation": args.activation,
         }))
         return {"auc": best["auc"], "acc": acc, "epoch": best["epoch"],
                 "tp": tp, "fp": fp, "fn": fn, "tn": tn, "path": path,
@@ -758,7 +777,9 @@ def load_ensemble(ckpt_glob, device):
     for cp in paths:
         ck = torch.load(cp, map_location=device, weights_only=False)
         m = SiameseBool(ck["backbone"], pretrained=False,
-                        p_drop=ck.get("dropout", 0.4)).to(device)
+                        p_drop=ck.get("dropout", 0.4),
+                        hidden=ck.get("hidden", 128),
+                        activation=ck.get("activation", "gelu")).to(device)
         m.load_state_dict(ck["model"])
         m.eval()
         models.append((m, ck["size"], ck["threshold"]))
@@ -940,6 +961,11 @@ def main():
                         "threshold instead of Youden's J")
     t.add_argument("--bs", type=int, default=16)
     t.add_argument("--dropout", type=float, default=0.4)
+    t.add_argument("--hidden", type=int, default=128,
+                   help="width of the head's hidden layer (default: 128)")
+    t.add_argument("--activation", default="relu",
+                   choices=sorted(ACTIVATIONS),
+                   help="head activation (default: relu)")
     t.add_argument("--height", type=int, default=256)
     t.add_argument("--width", type=int, default=256)
     t.add_argument("--seed", type=int, default=42)
