@@ -4,7 +4,6 @@
   "root": "../somethings_missing_here/training",
   "cache": true,
   "identity-negatives": true,
-  "folds": 5,
   "epochs": 60,
   "freeze-epochs": 10,
   "patience": 15,
@@ -13,5 +12,5 @@
   "bs": 8,
   "dropout": 0.4,
   "seed": 42,
-  "prefix": "kfold384_"
+  "prefix": "kmodel384"
 }

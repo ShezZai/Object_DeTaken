@@ -6,8 +6,9 @@ Two photos of a scene in, one boolean out: did anything go missing?
 
 | File | Role |
 |---|---|
-| `pairs_io.py` | Reads the folder tree into memory, synthesises reversed negatives, image cache, scene-grouped folds |
-| `train_missing.py` | **Main entry point.** `train` / `predict` / `evaluate`; `--torch` (ResNet18, default) or `--keras` (EfficientNetB0, saves `kfold<k>.keras` + `.json` sidecar) |
+| `pairs_io.py` | Reads the folder tree into memory, synthesises reversed negatives, image cache, scene-grouped train/val split |
+| `train_missing.py` | **Main entry point.** `train` / `predict` / `evaluate`; `--keras` (EfficientNetB0, default, saves `kmodel.keras` + `.json` sidecar) or `--torch` (ResNet18, saves `model.pt`) |
+| `keras_flow.ipynb` | Self-contained notebook of the Keras flow — installs, downloads the dataset, trains, evaluates, visualizes; runs top to bottom on its own |
 | `missing_items.py` | Detector-diff baseline (YOLO). Standalone, no training |
 | `bootstrap_labels.py` | Optional: pre-label pairs with the detector so you hand-correct instead of annotating from scratch |
 | `requirements.txt` | Dependencies |
@@ -57,7 +58,7 @@ from different collections stay distinct (`DeTaken/boxes` vs
 
 ### Rules that matter
 
-1. **One scene = one physical location/camera setup.** Folds are split by scene, so a scene is entirely in train or entirely in val. Getting this wrong is the difference between an honest 0.85 and a fake 0.97.
+1. **One scene = one physical location/camera setup.** The train/validation split is by scene, so a scene is entirely in train or entirely in val. Getting this wrong is the difference between an honest 0.85 and a fake 0.97.
 2. **Both labels in every scene.** Shoot a "nothing removed" pair at each location. A scene that is all-positive lets the model learn "that room ⇒ true"; `pairs_io` warns about this.
 3. **20–50 scenes, 200–500 pairs.** Scene diversity matters more than pair count.
 4. **Never reverse pairs on disk.** Reversed negatives are generated in memory and stay in their source scene automatically.
@@ -69,8 +70,8 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-CPU-only PyTorch is fine for this dataset size (~3–5 h for a full 5-fold run;
-~20–40 min on a free Colab T4).
+CPU-only PyTorch is fine for this dataset size (~30–60 min for a full run;
+a few minutes on a free Colab T4).
 
 ## Commands
 
@@ -81,7 +82,8 @@ single-label scenes and unlabelled pairs:
 python pairs_io.py data
 ```
 
-Train (scene-grouped 5-fold, saves `fold0.pt` … `fold4.pt`):
+Train (whole scenes held out for validation — see `--val-fraction` — saves
+`kmodel.keras` + `kmodel.json`):
 
 ```bash
 python train_missing.py train --root data --cache
@@ -89,7 +91,9 @@ python train_missing.py train --root data --cache
 python train_missing.py train --root ../somethings_missing_here/training --cache --identity-negatives
 ```
 
-Predict on one new pair (ensembles all fold checkpoints, hflip TTA):
+Predict on one new pair (hflip TTA with `--flip`; every checkpoint matching
+`--ckpt` is averaged, so several runs — e.g. different seeds — form an
+ensemble):
 
 ```bash
 python train_missing.py predict --before a.jpg --after b.jpg
@@ -97,7 +101,7 @@ python train_missing.py predict --before a.jpg --after b.jpg
 
 ```json
 { "any_missing": true, "prob": 0.812, "threshold": 0.463,
-  "models": 5, "per_model": [0.79, 0.85, 0.74, 0.88, 0.8] }
+  "models": 1, "per_model": [0.812] }
 ```
 
 Evaluate on a held-out folder (natural pairs only, no reversals):
@@ -108,15 +112,15 @@ python train_missing.py evaluate --root holdout --cache
 python train_missing.py evaluate --root ../somethings_missing_here/test --cache
 ```
 
-Keras implementation (same commands, add `--keras`; needs `keras>=3`, saves
-`kfold0.keras` … plus `.json` sidecars; uses EfficientNetB0 since
-keras.applications has no ResNet18. Sets `KERAS_BACKEND=torch` behind the
-scenes so the GPU works wherever torch does — export `KERAS_BACKEND`
-yourself to override):
+The default implementation is Keras 3 + EfficientNetB0 — it gave the best
+results (keras.applications has no ResNet18; sets `KERAS_BACKEND=torch`
+behind the scenes so the GPU works wherever torch does — export
+`KERAS_BACKEND` yourself to override). The PyTorch + ResNet18
+implementation is one flag away and saves `model.pt`:
 
 ```bash
-python train_missing.py train --keras --root data --cache
-python train_missing.py predict --keras --before a.jpg --after b.jpg
+python train_missing.py train --torch --root data --cache
+python train_missing.py predict --torch --before a.jpg --after b.jpg
 ```
 
 Any invocation can live in a JSON config instead of flags — keys mirror the
@@ -136,7 +140,7 @@ python train_missing.py train --config run.json --bs 8   # config + override
   "cache": true,
   "identity-negatives": true,
   "height": 384, "width": 384, "bs": 8,
-  "prefix": "kfold384_"
+  "prefix": "kmodel384"
 }
 ```
 
@@ -156,7 +160,7 @@ python bootstrap_labels.py data
 | `--height/--width` | 256 | Raise to 384 if items are small in frame. Halve `--bs` if you hit OOM |
 | `--backbone` | `resnet18` | `resnet34` above ~1000 pairs. `convnext_tiny` needs 12 GB+ |
 | `--bs` | 16 | Lower on small GPUs; the head uses LayerNorm so small batches are safe |
-| `--folds` | 5 | Needs at least this many scenes |
+| `--val-fraction` | 0.2 | Fraction of rows (whole scenes) held out for validation |
 | `--dropout` | 0.4 | Raise to 0.5–0.6 if train/val AUC diverge |
 | `--freeze-epochs` | 10 | Raise under ~250 pairs; the frozen encoder is doing most of the work |
 | `--no-reverse` | off | Only if you already materialised reversals on disk |
@@ -164,13 +168,15 @@ python bootstrap_labels.py data
 ## Reading the output
 
 ```
-AUC 0.883 +/- 0.041   acc 0.831 +/- 0.052
+ 68 val pairs | AUC 0.883 | acc 0.831 | TP 24 FP 5 FN 6 TN 33 | best epoch 12
 ```
 
-The spread matters as much as the mean at this data size.
+Validation is one scene-held-out subset, so the score moves with which
+scenes landed in it — rerun with a few `--seed` values before trusting a
+comparison.
 
-- **0.85–0.92 AUC, std < 0.05** — working as expected.
-- **High mean, std > 0.10** — one lucky fold. Add scenes, not epochs.
+- **0.85–0.92 AUC** — working as expected.
+- **Big swings across seeds** — validation scenes dominate the score. Add scenes, not epochs.
 - **Below 0.75** — usually items too small in frame (try `--height 384 --width 384`) or too little scene diversity.
 - **Val AUC ≫ its own held-out score** — a leak. Check that no location appears under two scene names.
 
@@ -187,13 +193,13 @@ outside COCO's 80 classes.
 - **Reversed positives as negatives.** A removal read backwards is an addition. Doubles the data, balances the classes, and forces the model to use that sign.
 - **Geometric augmentation shared, photometric independent.** Independent brightness/colour jitter is what teaches "the light changed" ≠ "the item is gone".
 - **Frozen encoder stays in `eval()`** so ImageNet BatchNorm running statistics survive fine-tuning on a few hundred images.
-- **Threshold from Youden's J** on each fold's validation split, stored in the checkpoint — not a hardcoded 0.5.
+- **Threshold from Youden's J** on the validation split, stored in the checkpoint — not a hardcoded 0.5.
 
 ## Troubleshooting
 
 | Symptom | Cause |
 |---|---|
-| `need >= 5 scenes` | Fewer scene folders than `--folds`. Lower `--folds` or split your data by location |
+| `need >= 2 scenes` | Validation holds out whole scenes, so at least two scene folders are required. Split your data by location |
 | `no label.json (unlabelled?)` | Pair folder without a label. `pairs_io.py` lists them |
 | Every prediction ~0.5 | Model learned nothing. Check that positives and negatives are not visually identical (wrong `before`/`after` naming) |
 | `AttributeError` in albumentations | Version 2.x renamed transform arguments. `pip install "albumentations<2"` |

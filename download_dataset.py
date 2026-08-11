@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """Download the somethings_missing_here dataset from Hugging Face.
 
-The repo is private, so a token is needed: read from the HF_TOKEN
-environment variable, or from the .env file next to this script
-(HF_TOKEN="hf_...").
+The repo is public -- no token or login needed.
 
     python download_dataset.py                # into ./somethings_missing_here
     python download_dataset.py --output /elsewhere
@@ -17,7 +15,6 @@ local copy first so the result mirrors the Hub exactly.
 from __future__ import annotations
 
 import argparse
-import os
 import shutil
 from pathlib import Path
 
@@ -25,20 +22,6 @@ from huggingface_hub import snapshot_download
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_REPO = "Shay85Gil/somethings_missing_here"
-
-
-def load_env_token() -> str | None:
-    """Read HF_TOKEN from the environment or a .env file next to this script."""
-    token = os.environ.get("HF_TOKEN")
-    if token:
-        return token
-    env_path = ROOT / ".env"
-    if env_path.is_file():
-        for line in env_path.read_text().splitlines():
-            key, _, value = line.partition("=")
-            if key.strip() == "HF_TOKEN":
-                return value.strip().strip('"').strip("'")
-    return None
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,10 +39,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    token = load_env_token()
-    if token is None:
-        raise SystemExit(
-            "error: no HF token found -- set HF_TOKEN or put it in .env")
 
     if args.fresh and args.output.exists():
         # Only wipe something that actually looks like a dataset copy, so a
@@ -73,7 +52,7 @@ def main() -> None:
         shutil.rmtree(args.output)
 
     path = snapshot_download(args.repo, repo_type="dataset",
-                             local_dir=args.output, token=token)
+                             local_dir=args.output)
 
     pairs = sum(1 for _ in Path(path).rglob("label.json"))
     print(f"Downloaded {args.repo} to {path} ({pairs} labeled pairs)")

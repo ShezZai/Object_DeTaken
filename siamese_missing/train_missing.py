@@ -8,12 +8,12 @@ tuned for a small dataset (200-500 pairs across 20-50 scenes).
     python train_missing.py evaluate --root holdout
 
 Two implementations behind one CLI, chosen per subcommand:
-    --torch (default)  ResNet18 encoder, saves fold<k>.pt
-    --keras            Keras 3 + EfficientNetB0, saves kfold<k>.keras plus a
-                       kfold<k>.json sidecar (threshold/metadata). Sets
+    --keras (default)  Keras 3 + EfficientNetB0, saves kmodel.keras plus a
+                       kmodel.json sidecar (threshold/metadata). Sets
                        KERAS_BACKEND=torch behind the scenes so the GPU works
                        wherever torch does; export KERAS_BACKEND yourself to
                        override (e.g. tensorflow on a supported GPU).
+    --torch            ResNet18 encoder, saves model.pt
 
 Reads the folder tree directly via pairs_io -- no manifest file, no generated
 folders. Reversed negatives are synthesised in memory.
@@ -26,6 +26,11 @@ import os
 import sys
 from pathlib import Path
 
+# albumentations 2.x renamed transform arguments and breaks the pipeline
+# below, so requirements pin <2 -- silence its upgrade nag (must be set
+# before the import).
+os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
+
 import albumentations as A
 import cv2
 import numpy as np
@@ -35,7 +40,13 @@ import torch.nn as nn
 from sklearn.metrics import roc_auc_score, roc_curve
 from torch.utils.data import DataLoader, Dataset
 
-from pairs_io import ImageCache, load_pairs, scene_folds
+from pairs_io import ImageCache, load_pairs, scene_split
+
+# head activations shared by both implementations; keras takes the name
+# directly, torch needs the module.
+ACTIVATIONS = {"gelu": nn.GELU, "relu": nn.ReLU, "silu": nn.SiLU,
+               "elu": nn.ELU, "tanh": nn.Tanh,
+               "leaky_relu": nn.LeakyReLU}
 
 MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
@@ -54,11 +65,15 @@ def seed_all(seed):
 # --------------------------------------------------------------------------- #
 # augmentation (shared by both implementations)
 # --------------------------------------------------------------------------- #
-def build_transforms(size, train):
+def build_transforms(size, train, flip=False):
     """
     geometric   -> identical on both images (one shared transform)
     photometric -> independent per image (teaches 'lighting change != item gone')
     jitter      -> small extra warp on `after` only, for registration slack
+
+    flip=True adds a horizontal flip (and its test-time counterpart, see
+    pair_prob). Off by default: left-right orientation is meaningful in
+    these scenes, and mirroring can cost more than the 2x data gains.
     """
     h, w = size
     shared = [
@@ -67,11 +82,10 @@ def build_transforms(size, train):
         A.CenterCrop(h, w),          # guarantees an exact, collatable shape
     ]
     if train:
-        shared += [
-            A.HorizontalFlip(p=0.5),
-            A.Affine(scale=(0.9, 1.1), translate_percent=0.05,
-                     rotate=(-7, 7), p=0.7),
-        ]
+        if flip:
+            shared.append(A.HorizontalFlip(p=0.5))
+        shared.append(A.Affine(scale=(0.9, 1.1), translate_percent=0.05,
+                               rotate=(-7, 7), p=0.7))
     shared = A.Compose(shared, additional_targets={"image2": "image"})
     jitter = A.Affine(translate_percent=0.02, rotate=(-2, 2), p=0.5) if train else None
     photo = A.Compose([
@@ -91,21 +105,88 @@ def read_image(path, cache=None):
     return cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
 
 
+def align_rows(rows, cache=None, max_side=640, verbose=True):
+    """Precompute ECC-aligned versions of every unique (before, after) pair
+    using align_images.py's logic: warp before into after's frame and crop
+    both to their largest shared valid rectangle.
+
+    Returns {(before_path, after_path): (before_rgb, after_rgb)}. Reversed
+    rows reuse the same entry swapped; identity rows need no alignment.
+    Pairs where ECC fails to converge fall back to their unaligned images.
+    """
+    import contextlib
+    import io
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pipeline"))
+    try:
+        from align_images import align_to_reference, largest_valid_rectangle
+    except ImportError:
+        raise SystemExit(
+            "error: --align needs align_images.py from the pipeline/ folder")
+
+    def load(path):
+        img = read_image(path, cache)
+        h, w = img.shape[:2]
+        s = max_side / max(h, w)
+        if s < 1.0:
+            img = cv2.resize(img, (round(w * s), round(h * s)),
+                             interpolation=cv2.INTER_AREA)
+        return img
+
+    pairs = sorted({(r["before"], r["after"]) for r in rows
+                    if not r.get("reversed") and not r.get("identity")})
+    aligned, failed = {}, 0
+    for i, (before_path, after_path) in enumerate(pairs):
+        before, after = load(before_path), load(after_path)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                warped, mask = align_to_reference(
+                    before, after, alignment_max_size=384)
+            left, top, right, bottom = largest_valid_rectangle(mask)
+            aligned[(before_path, after_path)] = (
+                np.ascontiguousarray(warped[top:bottom, left:right]),
+                np.ascontiguousarray(after[top:bottom, left:right]))
+        except (ValueError, cv2.error):
+            failed += 1
+        if verbose and (i + 1) % 25 == 0:
+            print(f"\r  aligning pairs: {i + 1}/{len(pairs)}",
+                  end="" if sys.stdout.isatty() else "\n", flush=True)
+    if verbose:
+        end = "\r" + " " * 40 + "\r" if sys.stdout.isatty() else ""
+        print(f"{end}aligned {len(aligned)}/{len(pairs)} pairs"
+              + (f" ({failed} failed, kept unaligned)" if failed else ""))
+    return aligned
+
+
 # --------------------------------------------------------------------------- #
 # dataset (torch)
 # --------------------------------------------------------------------------- #
+def pair_images(r, cache=None, aligned=None):
+    """The pair's two RGB arrays, preferring precomputed aligned versions."""
+    if aligned:
+        entry = aligned.get((r["before"], r["after"]))
+        if entry is not None:
+            return entry
+        entry = aligned.get((r["after"], r["before"]))
+        if entry is not None:                    # reversed row: swap back
+            return entry[1], entry[0]
+    return (read_image(r["before"], cache), read_image(r["after"], cache))
+
+
 class PairSet(Dataset):
-    def __init__(self, rows, size=(256, 256), train=True, cache=None):
+    def __init__(self, rows, size=(256, 256), train=True, cache=None,
+                 aligned=None, flip=False):
         self.rows, self.train, self.cache = rows, train, cache
-        self.shared, self.jitter, self.photo = build_transforms(size, train)
+        self.aligned = aligned
+        self.shared, self.jitter, self.photo = build_transforms(
+            size, train, flip)
 
     def __len__(self):
         return len(self.rows)
 
     def __getitem__(self, i):
         r = self.rows[i]
-        out = self.shared(image=read_image(r["before"], self.cache),
-                          image2=read_image(r["after"], self.cache))
+        before, after = pair_images(r, self.cache, self.aligned)
+        out = self.shared(image=before, image2=after)
         a, b = out["image"], out["image2"]
         if self.jitter is not None:
             b = self.jitter(image=b)["image"]
@@ -119,7 +200,8 @@ class PairSet(Dataset):
 # model (torch)
 # --------------------------------------------------------------------------- #
 class SiameseBool(nn.Module):
-    def __init__(self, backbone="resnet18", pretrained=True, p_drop=0.4):
+    def __init__(self, backbone="resnet18", pretrained=True, p_drop=0.4,
+                 hidden=128, activation="gelu"):
         super().__init__()
         # ONE encoder called twice == shared weights. That is the siamese part.
         # Not two encoders: (1) the head subtracts features, which only means
@@ -133,10 +215,11 @@ class SiameseBool(nn.Module):
         # LayerNorm not BatchNorm: batches are small, so batch statistics are
         # noisy and batch-size dependent.
         self.head = nn.Sequential(
-            nn.Dropout(0.2),
-            nn.Linear(3 * d, 128), nn.LayerNorm(128), nn.GELU(),
             nn.Dropout(p_drop),
-            nn.Linear(128, 1),
+            nn.Linear(3 * d, hidden), nn.LayerNorm(hidden),
+            ACTIVATIONS[activation](),
+            nn.Dropout(p_drop),
+            nn.Linear(hidden, 1),
         )
         self.enc_frozen = False
 
@@ -206,11 +289,11 @@ def confusion(y, p, thr):
             int(((pred == 0) & (y == 1)).sum()), int(((pred == 0) & (y == 0)).sum()))
 
 
-def epoch_progress(fold, epoch, args, score, best, patience):
+def epoch_progress(epoch, args, score, best, patience):
     """Live one-line status: in-place on a terminal, one line per epoch when
     piped (logs, Colab) so progress stays visible either way."""
     name = getattr(args, "metric", "auc")
-    line = (f"fold {fold} epoch {epoch + 1}/{args.epochs} | "
+    line = (f"epoch {epoch + 1}/{args.epochs} | "
             f"val {name} {score:.3f} | best {best['score']:.3f} @ epoch "
             f"{best['epoch']} | patience {patience}/{args.patience}")
     if sys.stdout.isatty():
@@ -222,6 +305,38 @@ def epoch_progress(fold, epoch, args, score, best, patience):
 def epoch_progress_done():
     if sys.stdout.isatty():
         print("\r" + " " * 100 + "\r", end="", flush=True)
+
+
+def save_history_graph(path, result):
+    """Per-epoch validation AUC and accuracy for the run; the dot on each
+    line marks the epoch whose checkpoint was kept. Accuracy is measured at
+    each epoch's own selected threshold."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("warning: --graph needs matplotlib "
+              "(pip install matplotlib); skipping graph")
+        return
+
+    fig, ax = plt.subplots(figsize=(7, 4.2))
+    for key, label, color in (("auc", "val AUC", "#2a78d6"),
+                              ("acc", "val accuracy", "#eb6834")):
+        curve = [h[key] for h in result["history"]]
+        ax.plot(range(1, len(curve) + 1), curve, color=color,
+                linewidth=2, label=label)
+        if 0 <= result["epoch"] < len(curve):
+            ax.plot(result["epoch"] + 1, curve[result["epoch"]], "o",
+                    color=color, markersize=6)
+    ax.set_xlabel("epoch")
+    ax.grid(axis="y", color="#000000", alpha=0.08, linewidth=0.8)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.legend(frameon=False, fontsize=9)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"training curves: {path}")
 
 
 # --------------------------------------------------------------------------- #
@@ -245,13 +360,13 @@ def save_cam_panel(path, before_rgb, after_rgb, cam_before, cam_after, caption):
     cv2.imwrite(str(path), np.vstack([strip, panel])[..., ::-1])
 
 
-def torch_grad_cam(model, row, size, device, cache=None):
+def torch_grad_cam(model, row, size, device, cache=None, aligned=None):
     """Grad-CAM of the 'missing' logit at the encoder's last spatial layer.
 
     Returns (before_rgb, after_rgb, cam_before, cam_after): the network's
     actual inputs (denormalized) and one [0,1] heatmap per branch.
     """
-    ds = PairSet([row], size, train=False, cache=cache)
+    ds = PairSet([row], size, train=False, cache=cache, aligned=aligned)
     a, b, _ = ds[0]
     a, b = a[None].to(device), b[None].to(device)
 
@@ -294,17 +409,22 @@ def torch_grad_cam(model, row, size, device, cache=None):
 # --------------------------------------------------------------------------- #
 # training (torch)
 # --------------------------------------------------------------------------- #
-def train_fold(tr_rows, va_rows, args, device, fold, cache):
-    seed_all(args.seed + fold)
+def train_model(tr_rows, va_rows, args, device, cache, aligned=None):
+    seed_all(args.seed)
     size = (args.height, args.width)
+    flip = args.flip
     workers = 0 if cache is not None else args.workers
 
-    tr = DataLoader(PairSet(tr_rows, size, True, cache), batch_size=args.bs,
+    tr = DataLoader(PairSet(tr_rows, size, True, cache, aligned, flip),
+                    batch_size=args.bs,
                     shuffle=True, num_workers=workers)
-    va = DataLoader(PairSet(va_rows, size, False, cache), batch_size=args.bs,
+    va = DataLoader(PairSet(va_rows, size, False, cache, aligned, flip),
+                    batch_size=args.bs,
                     num_workers=workers)
 
-    model = SiameseBool(args.backbone, p_drop=args.dropout).to(device)
+    model = SiameseBool(args.backbone, p_drop=args.dropout,
+                        hidden=args.hidden,
+                        activation=args.activation).to(device)
     model.freeze_encoder(True)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
                             lr=1e-3, weight_decay=1e-4)
@@ -312,6 +432,7 @@ def train_fold(tr_rows, va_rows, args, device, fold, cache):
 
     best = {"score": -1.0, "auc": -1.0, "thr": 0.5, "state": None, "epoch": -1}
     patience = 0
+    history = []
 
     for epoch in range(args.epochs):
         if epoch == args.freeze_epochs:          # unfreeze, low LR on the backbone
@@ -331,6 +452,8 @@ def train_fold(tr_rows, va_rows, args, device, fold, cache):
         p, y = probs_and_labels(model, va, device)
         auc = roc_auc_score(y, p) if len(set(y)) > 1 else float("nan")
         score, thr = val_metric(args.metric, y, p)
+        history.append({"auc": float(auc),
+                        "acc": float(((p > thr) == (y == 1)).mean())})
 
         if score > best["score"]:
             best = {"score": float(score), "auc": float(auc), "thr": thr,
@@ -341,7 +464,7 @@ def train_fold(tr_rows, va_rows, args, device, fold, cache):
         else:
             patience += 1
 
-        epoch_progress(fold, epoch, args, score, best, patience)
+        epoch_progress(epoch, args, score, best, patience)
         if patience >= args.patience:
             break
 
@@ -351,13 +474,14 @@ def train_fold(tr_rows, va_rows, args, device, fold, cache):
     tp, fp, fn, tn = confusion(y, p, best["thr"])
     acc = (tp + tn) / max(len(y), 1)
 
-    path = f"{args.prefix}{fold}.pt"
+    path = f"{args.prefix}.pt"
     torch.save({"model": best["state"], "backbone": args.backbone, "size": size,
                 "threshold": best["thr"], "val_auc": best["auc"],
-                "dropout": args.dropout}, path)
+                "dropout": args.dropout, "hidden": args.hidden,
+                "activation": args.activation}, path)
     return {"auc": best["auc"], "acc": acc, "epoch": best["epoch"],
             "tp": tp, "fp": fp, "fn": fn, "tn": tn, "path": path,
-            "n_val": len(y)}
+            "n_val": len(y), "history": history}
 
 
 # --------------------------------------------------------------------------- #
@@ -383,21 +507,24 @@ def keras_impl():
         0-255 float here."""
 
         def __init__(self, rows, size=(256, 256), train=True, cache=None,
-                     batch_size=16, shuffle=None, seed=0, **kwargs):
+                     batch_size=16, shuffle=None, seed=0, aligned=None,
+                     flip=False, **kwargs):
             super().__init__(**kwargs)
             self.rows = list(rows)
             self.cache = cache
+            self.aligned = aligned
             self.batch_size = batch_size
             self.shuffle = train if shuffle is None else shuffle
             self.rng = np.random.default_rng(seed)
             self.order = np.arange(len(self.rows))
-            self.shared, self.jitter, self.photo = build_transforms(size, train)
+            self.shared, self.jitter, self.photo = build_transforms(
+                size, train, flip)
             if self.shuffle:
                 self.rng.shuffle(self.order)
 
         def _sample(self, r):
-            out = self.shared(image=read_image(r["before"], self.cache),
-                              image2=read_image(r["after"], self.cache))
+            before, after = pair_images(r, self.cache, self.aligned)
+            out = self.shared(image=before, image2=after)
             a, b = out["image"], out["image2"]
             if self.jitter is not None:
                 b = self.jitter(image=b)["image"]
@@ -421,7 +548,8 @@ def keras_impl():
             if self.shuffle:
                 self.rng.shuffle(self.order)
 
-    def build_model(size=(256, 256), pretrained=True, p_drop=0.4):
+    def build_model(size=(256, 256), pretrained=True, p_drop=0.4,
+                    hidden=128, activation="gelu"):
         h, w = size
         # ONE backbone applied to both inputs == shared weights (the siamese
         # part). In the functional API, calling the same layer instance twice
@@ -445,12 +573,12 @@ def keras_impl():
         # abs() would be symmetric and could not tell the two apart, which is
         # exactly the distinction the reversed-pair negatives train.
         x = layers.Concatenate()([fa, fb, layers.Subtract()([fa, fb])])
-        x = layers.Dropout(0.2)(x)
-        x = layers.Dense(128)(x)
+        x = layers.Dropout(p_drop)(x)
+        x = layers.Dense(hidden)(x)
         # LayerNorm not BatchNorm: batches are small, so batch statistics are
         # noisy and batch-size dependent.
         x = layers.LayerNormalization()(x)
-        x = layers.Activation("gelu")(x)
+        x = layers.Activation(activation)(x)
         x = layers.Dropout(p_drop)(x)
         out = layers.Dense(1, name="logit")(x)
         model = keras.Model([inp_a, inp_b], out)
@@ -472,21 +600,25 @@ def keras_impl():
             ys.append(y)
         return np.concatenate(ps), np.concatenate(ys)
 
-    def k_train_fold(tr_rows, va_rows, args, fold, cache):
-        keras.utils.set_random_seed(args.seed + fold)
+    def k_train_model(tr_rows, va_rows, args, cache, aligned=None):
+        keras.utils.set_random_seed(args.seed)
         size = (args.height, args.width)
+        flip = args.flip
 
         tr = PairSequence(tr_rows, size, True, cache, args.bs,
-                          seed=args.seed + fold)
-        va = PairSequence(va_rows, size, False, cache, args.bs, shuffle=False)
+                          seed=args.seed, aligned=aligned, flip=flip)
+        va = PairSequence(va_rows, size, False, cache, args.bs,
+                          shuffle=False, aligned=aligned, flip=flip)
 
-        model = build_model(size, p_drop=args.dropout)
+        model = build_model(size, p_drop=args.dropout,
+                            hidden=args.hidden, activation=args.activation)
         model.backbone.trainable = False   # frozen BN stays in inference mode
         compile_model(model, lr=1e-3)
 
         best = {"score": -1.0, "auc": -1.0, "thr": 0.5,
                 "weights": None, "epoch": -1}
         patience = 0
+        history = []
 
         for epoch in range(args.epochs):
             if epoch == args.freeze_epochs:  # unfreeze, low LR on everything
@@ -498,6 +630,8 @@ def keras_impl():
             p, y = k_probs_and_labels(model, va)
             auc = roc_auc_score(y, p) if len(set(y)) > 1 else float("nan")
             score, thr = val_metric(args.metric, y, p)
+            history.append({"auc": float(auc),
+                            "acc": float(((p > thr) == (y == 1)).mean())})
 
             if score > best["score"]:
                 best = {"score": float(score), "auc": float(auc), "thr": thr,
@@ -506,7 +640,7 @@ def keras_impl():
             else:
                 patience += 1
 
-            epoch_progress(fold, epoch, args, score, best, patience)
+            epoch_progress(epoch, args, score, best, patience)
             if patience >= args.patience:
                 break
 
@@ -516,16 +650,17 @@ def keras_impl():
         tp, fp, fn, tn = confusion(y, p, best["thr"])
         acc = (tp + tn) / max(len(y), 1)
 
-        path = f"{args.prefix}{fold}.keras"
+        path = f"{args.prefix}.keras"
         model.save(path)
-        Path(f"{args.prefix}{fold}.json").write_text(json.dumps({
+        Path(f"{args.prefix}.json").write_text(json.dumps({
             "size": [args.height, args.width], "threshold": best["thr"],
             "val_auc": best["auc"], "backbone": "efficientnetb0",
-            "dropout": args.dropout,
+            "dropout": args.dropout, "hidden": args.hidden,
+            "activation": args.activation,
         }))
         return {"auc": best["auc"], "acc": acc, "epoch": best["epoch"],
                 "tp": tp, "fp": fp, "fn": fn, "tn": tn, "path": path,
-                "n_val": len(y)}
+                "n_val": len(y), "history": history}
 
     def k_load_ensemble(ckpt_glob):
         paths = sorted(glob.glob(ckpt_glob))
@@ -538,25 +673,27 @@ def keras_impl():
                            tuple(meta["size"]), meta["threshold"]))
         return models
 
-    def k_pair_prob(model, before, after, size, cache=None):
+    def k_pair_prob(model, before, after, size, cache=None, aligned=None,
+                    flip=False):
         seq = PairSequence([{"before": before, "after": after, "y": 0.0}],
                            size, train=False, cache=cache, batch_size=1,
-                           shuffle=False)
+                           shuffle=False, aligned=aligned)
         (a, b), _ = seq[0]
         # hflip TTA: cheap, reduces variance on a small model
-        logits = [model.predict_on_batch((a, b)).squeeze(),
-                  model.predict_on_batch((np.flip(a, 2).copy(),
-                                          np.flip(b, 2).copy())).squeeze()]
+        logits = [model.predict_on_batch((a, b)).squeeze()]
+        if flip:
+            logits.append(model.predict_on_batch(
+                (np.flip(a, 2).copy(), np.flip(b, 2).copy())).squeeze())
         return float(1.0 / (1.0 + np.exp(-np.mean(logits))))
 
-    def k_grad_cam(model, row, size, cache=None):
+    def k_grad_cam(model, row, size, cache=None, aligned=None):
         """Grad-CAM under the torch backend: split the model at the
         backbone's last spatial layer, re-run pooling + head under autograd,
         and take gradients of the logit w.r.t. the feature maps."""
         import torch
 
         seq = PairSequence([row], size, train=False, cache=cache,
-                           batch_size=1, shuffle=False)
+                           batch_size=1, shuffle=False, aligned=aligned)
         (a, b), _ = seq[0]
 
         backbone = next(l for l in model.layers if isinstance(l, keras.Model))
@@ -584,7 +721,7 @@ def keras_impl():
 
     from types import SimpleNamespace
     _KERAS_IMPL = SimpleNamespace(
-        train_fold=k_train_fold, load_ensemble=k_load_ensemble,
+        train_model=k_train_model, load_ensemble=k_load_ensemble,
         pair_prob=k_pair_prob, grad_cam=k_grad_cam,
     )
     return _KERAS_IMPL
@@ -595,9 +732,9 @@ def keras_impl():
 # --------------------------------------------------------------------------- #
 def resolve_defaults(args):
     if getattr(args, "prefix", None) is None:
-        args.prefix = "kfold" if args.keras else "fold"
+        args.prefix = "kmodel" if args.keras else "model"
     if getattr(args, "ckpt", None) is None:
-        args.ckpt = "kfold*.keras" if args.keras else "fold*.pt"
+        args.ckpt = "kmodel*.keras" if args.keras else "model*.pt"
 
 
 def cmd_train(args):
@@ -608,15 +745,15 @@ def cmd_train(args):
         device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
         print(f"device: {device}\n")
 
-    rows = load_pairs(args.root, reverse_positives=not args.no_reverse,
+    rows = load_pairs(args.root, reverse_positives=args.reverse,
                       identity_negatives=args.identity_negatives)
 
     if args.challenge_root:
         challenge = load_pairs(args.challenge_root,
-                               reverse_positives=not args.no_reverse,
+                               reverse_positives=args.reverse,
                                identity_negatives=args.identity_negatives)
-        # Same physical location must stay one scene for fold grouping:
-        # match challenge scenes to training scenes by their base name.
+        # Same physical location must stay one scene for the scene-held-out
+        # split: match challenge scenes to training scenes by their base name.
         by_base = {r["scene"].split("/")[-1]: r["scene"] for r in rows}
         unmatched = set()
         for r in challenge:
@@ -635,34 +772,30 @@ def cmd_train(args):
         for s in sorted(unmatched):
             print(f"  note: challenge scene {s} matches no training scene -- "
                   f"if it is the same physical location under another name, "
-                  f"folds may leak it")
+                  f"the split may leak it")
 
     cache = ImageCache(args.cache_side).warm(rows) if args.cache else None
+    aligned = align_rows(rows, cache) if args.align else None
     print()
 
-    results = []
-    for k, (tr_rows, va_rows) in enumerate(scene_folds(rows, args.folds, args.seed)):
-        # identity negatives are train-only: without augmentation they are
-        # pixel-identical and would flatter validation
-        va_rows = [r for r in va_rows if not r.get("identity", False)]
-        if args.keras:
-            r = impl.train_fold(tr_rows, va_rows, args, k, cache)
-        else:
-            r = train_fold(tr_rows, va_rows, args, device, k, cache)
-        results.append(r)
-        print(f"fold {k}: {r['n_val']:3d} val pairs | AUC {r['auc']:.3f} | "
-              f"acc {r['acc']:.3f} | TP {r['tp']} FP {r['fp']} FN {r['fn']} "
-              f"TN {r['tn']} | best epoch {r['epoch']}")
+    tr_rows, va_rows = scene_split(rows, args.seed, args.val_fraction)
+    # identity negatives are train-only: without augmentation they are
+    # pixel-identical and would flatter validation
+    va_rows = [r for r in va_rows if not r.get("identity", False)]
+    if args.keras:
+        r = impl.train_model(tr_rows, va_rows, args, cache, aligned)
+    else:
+        r = train_model(tr_rows, va_rows, args, device, cache, aligned)
+    print(f"{r['n_val']:3d} val pairs | AUC {r['auc']:.3f} | "
+          f"acc {r['acc']:.3f} | TP {r['tp']} FP {r['fp']} FN {r['fn']} "
+          f"TN {r['tn']} | best epoch {r['epoch']}")
 
-    aucs = np.array([r["auc"] for r in results])
-    accs = np.array([r["acc"] for r in results])
-    suffix = "keras" if args.keras else "pt"
-    print(f"\nAUC {aucs.mean():.3f} +/- {aucs.std():.3f}"
-          f"   acc {accs.mean():.3f} +/- {accs.std():.3f}")
-    print(f"checkpoints: {args.prefix}0.{suffix} ... "
-          f"{args.prefix}{args.folds - 1}.{suffix}")
-    print("read the spread as well as the mean -- at this data size one lucky "
-          "fold can carry the average")
+    if args.graph:
+        save_history_graph(args.graph if isinstance(args.graph, str)
+                           else f"{args.prefix}curves.png", r)
+    print(f"\ncheckpoint: {r['path']}")
+    print("validation is one scene-held-out subset -- rerun with other "
+          "--seed values to gauge how much the score moves")
 
 
 # --------------------------------------------------------------------------- #
@@ -676,7 +809,9 @@ def load_ensemble(ckpt_glob, device):
     for cp in paths:
         ck = torch.load(cp, map_location=device, weights_only=False)
         m = SiameseBool(ck["backbone"], pretrained=False,
-                        p_drop=ck.get("dropout", 0.4)).to(device)
+                        p_drop=ck.get("dropout", 0.4),
+                        hidden=ck.get("hidden", 128),
+                        activation=ck.get("activation", "gelu")).to(device)
         m.load_state_dict(ck["model"])
         m.eval()
         models.append((m, ck["size"], ck["threshold"]))
@@ -684,26 +819,30 @@ def load_ensemble(ckpt_glob, device):
 
 
 @torch.no_grad()
-def pair_prob(model, before, after, size, device, cache=None):
+def pair_prob(model, before, after, size, device, cache=None, aligned=None,
+              flip=False):
     ds = PairSet([{"before": before, "after": after, "y": 0.0}],
-                 size, train=False, cache=cache)
+                 size, train=False, cache=cache, aligned=aligned)
     a, b, _ = ds[0]
     a, b = a[None].to(device), b[None].to(device)
     # hflip TTA: cheap, reduces variance on a small model
-    logits = torch.stack([model(a, b),
-                          model(torch.flip(a, [-1]), torch.flip(b, [-1]))])
-    return float(torch.sigmoid(logits.mean()).item())
+    logits = [model(a, b)]
+    if flip:
+        logits.append(model(torch.flip(a, [-1]), torch.flip(b, [-1])))
+    return float(torch.sigmoid(torch.stack(logits).mean()).item())
 
 
-def make_pair_scorer(args, cache=None):
+def make_pair_scorer(args, cache=None, aligned=None):
     """Return (models, score(model, size, before, after)) for either backend."""
     if args.keras:
         impl = keras_impl()
         models = impl.load_ensemble(args.ckpt)
-        return models, lambda m, size, bf, af: impl.pair_prob(m, bf, af, size, cache)
+        return models, lambda m, size, bf, af: impl.pair_prob(
+            m, bf, af, size, cache, aligned, args.flip)
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     models = load_ensemble(args.ckpt, device)
-    return models, lambda m, size, bf, af: pair_prob(m, bf, af, size, device, cache)
+    return models, lambda m, size, bf, af: pair_prob(
+        m, bf, af, size, device, cache, aligned, args.flip)
 
 
 def cmd_predict(args):
@@ -731,7 +870,8 @@ def cmd_evaluate(args):
     # natural pairs only: reversals would flatter the score
     rows = load_pairs(args.root, reverse_positives=False)
     cache = ImageCache(args.cache_side).warm(rows) if args.cache else None
-    models, score = make_pair_scorer(args, cache)
+    aligned = align_rows(rows, cache) if args.align else None
+    models, score = make_pair_scorer(args, cache, aligned)
     print()
 
     y = np.array([r["y"] for r in rows])
@@ -769,10 +909,10 @@ def cmd_evaluate(args):
         model0, size0, _ = models[0]
         if args.keras:
             impl = keras_impl()
-            cam_fn = lambda row: impl.grad_cam(model0, row, size0, cache)
+            cam_fn = lambda row: impl.grad_cam(model0, row, size0, cache, aligned)
         else:
             device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-            cam_fn = lambda row: torch_grad_cam(model0, row, size0, device, cache)
+            cam_fn = lambda row: torch_grad_cam(model0, row, size0, device, cache, aligned)
         chosen = range(len(rows)) if args.viz_all else failures
         for i in chosen:
             r = rows[i]
@@ -808,15 +948,20 @@ def main():
     backend = argparse.ArgumentParser(add_help=False)
     group = backend.add_mutually_exclusive_group()
     group.add_argument("--keras", action="store_true",
-                       help="Keras implementation (EfficientNetB0); sets "
-                            "KERAS_BACKEND=torch unless already set")
+                       help="Keras implementation (EfficientNetB0, default); "
+                            "sets KERAS_BACKEND=torch unless already set")
     group.add_argument("--torch", dest="keras", action="store_false",
-                       help="PyTorch implementation (ResNet18, default)")
-    backend.set_defaults(keras=False)
+                       help="PyTorch implementation (ResNet18)")
+    backend.set_defaults(keras=True)
     backend.add_argument("--device", default=None,
                          help="cuda | cpu | mps (torch implementation only)")
     backend.add_argument("--config", default=None,
                          help="JSON file with flag values (CLI flags override)")
+    backend.add_argument("--flip", action="store_true",
+                         help="enable horizontal flips: adds the shared flip to "
+                              "training augmentation and a flipped pass to "
+                              "test-time averaging (off by default; use the "
+                              "same setting for train and inference)")
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=None,
@@ -828,12 +973,14 @@ def main():
     t.add_argument("--challenge-root", "--challenge_root", default=None,
                    help="extra folder of harder training pairs (e.g. "
                         "../somethings_missing_here/challenging/training); "
-                        "scenes matching a training scene by name share its "
-                        "fold")
+                        "scenes matching a training scene by name stay on "
+                        "its side of the split")
     t.add_argument("--backbone", default="resnet18",
                    help="timm model name (torch only; keras always uses "
                         "EfficientNetB0)")
-    t.add_argument("--folds", type=int, default=5)
+    t.add_argument("--val-fraction", type=float, default=0.2,
+                   help="fraction of rows held out (whole scenes) for "
+                        "validation (default: 0.2)")
     t.add_argument("--epochs", type=int, default=60)
     t.add_argument("--freeze-epochs", type=int, default=10)
     t.add_argument("--patience", type=int, default=15)
@@ -843,16 +990,29 @@ def main():
                         "threshold instead of Youden's J")
     t.add_argument("--bs", type=int, default=16)
     t.add_argument("--dropout", type=float, default=0.4)
+    t.add_argument("--hidden", type=int, default=128,
+                   help="width of the head's hidden layer (default: 128)")
+    t.add_argument("--activation", default="relu",
+                   choices=sorted(ACTIVATIONS),
+                   help="head activation (default: relu)")
     t.add_argument("--height", type=int, default=256)
     t.add_argument("--width", type=int, default=256)
     t.add_argument("--seed", type=int, default=42)
     t.add_argument("--prefix", default=None,
-                   help="checkpoint prefix (default: fold / kfold)")
+                   help="checkpoint name prefix (default: model / kmodel)")
     t.add_argument("--workers", type=int, default=2)
     t.add_argument("--cache", action="store_true", help="decode images once into RAM")
+    t.add_argument("--align", action="store_true",
+                   help="ECC-align each pair (align_images.py logic) before "
+                        "training; one-off precompute, ~1s per pair")
     t.add_argument("--cache-side", type=int, default=640)
-    t.add_argument("--no-reverse", action="store_true",
-                   help="skip synthesised reversed negatives")
+    t.add_argument("--graph", nargs="?", const=True, default=None,
+                   metavar="FILE",
+                   help="plot per-epoch validation AUC and accuracy to FILE "
+                        "(default: <prefix>curves.png); needs matplotlib")
+    t.add_argument("--reverse", action="store_true",
+                   help="add a swapped-order negative per positive (a removal "
+                        "read backwards is an addition); off by default")
     t.add_argument("--identity-negatives", action="store_true",
                    help="add same-photo no-change negatives (for datasets "
                         "with no natural negative pairs)")
@@ -860,7 +1020,8 @@ def main():
 
     p = sub.add_parser("predict", parents=[backend])
     p.add_argument("--ckpt", default=None,
-                   help="checkpoint glob (default: fold*.pt / kfold*.keras)")
+                   help="checkpoint glob (default: model*.pt / kmodel*.keras); "
+                        "several matches are averaged as an ensemble")
     p.add_argument("--before", default=None, help="required (flag or config)")
     p.add_argument("--after", default=None, help="required (flag or config)")
     p.set_defaults(func=cmd_predict)
@@ -869,8 +1030,12 @@ def main():
     e.add_argument("--root", default=None,
                    help="held-out folder, same layout; required (flag or config)")
     e.add_argument("--ckpt", default=None,
-                   help="checkpoint glob (default: fold*.pt / kfold*.keras)")
+                   help="checkpoint glob (default: model*.pt / kmodel*.keras); "
+                        "several matches are averaged as an ensemble")
     e.add_argument("--cache", action="store_true")
+    e.add_argument("--align", action="store_true",
+                   help="ECC-align each pair before evaluation (use when the "
+                        "model was trained with --align)")
     e.add_argument("--cache-side", type=int, default=640)
     e.add_argument("--viz", default=None, metavar="FOLDER",
                    help="save grad-cam panels for failed pairs to FOLDER")
