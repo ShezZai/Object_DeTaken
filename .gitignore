@@ -18,6 +18,7 @@ unique_objects.jpg
 align_compare_test_results/
 /pairs.txt
 siamese_missing/*.png
+siamese_missing/*.log
 
 # datasets (raw Remove360 download; curated set lives on HF)
 Remove360/

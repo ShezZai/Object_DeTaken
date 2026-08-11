@@ -38,7 +38,7 @@ Ultralytics on first run.
 Align the two pictures, then detect and mark objects unique to picture 1:
 
 ```bash
-python align_and_compare.py with_chair.jpg without_chair.jpg -o unique_objects.jpg
+python pipeline/align_and_compare.py with_chair.jpg without_chair.jpg -o unique_objects.jpg
 ```
 
 Useful options:
@@ -58,22 +58,22 @@ Useful options:
 Align picture 1 to picture 2 and save both cropped to their shared valid area:
 
 ```bash
-python align_images.py with_chair.jpg without_chair.jpg
+python pipeline/align_images.py with_chair.jpg without_chair.jpg
 ```
 
 Compare two already-aligned pictures:
 
 ```bash
-python compare_yolo_objects.py with_chair_aligned.jpg without_chair_aligned.jpg
+python pipeline/compare_yolo_objects.py with_chair_aligned.jpg without_chair_aligned.jpg
 ```
 
 ## How it works
 
-1. **Alignment** (`align_images.py`) — estimates an affine transform with
+1. **Alignment** (`pipeline/align_images.py`) — estimates an affine transform with
    OpenCV ECC on downscaled copies, warps picture 1 into picture 2's
    coordinate system, and crops both to the largest rectangle of shared valid
    pixels.
-2. **Detection** (`compare_yolo_objects.py`) — runs a YOLO detector on both
+2. **Detection** (`pipeline/compare_yolo_objects.py`) — runs a YOLO detector on both
    pictures, and adds label-independent candidate boxes from thresholded image
    differences so objects YOLO misses can still be flagged.
 3. **Filtering** — a picture-1 box is kept only if it has no overlapping box
@@ -86,9 +86,9 @@ python compare_yolo_objects.py with_chair_aligned.jpg without_chair_aligned.jpg
 
 ## Files
 
-- `align_and_compare.py` — one-command pipeline (align, then compare)
-- `align_images.py` — image alignment step
-- `compare_yolo_objects.py` — detection, comparison, and marking step
+- `pipeline/` — the alignment + detection pipeline (see `pipeline/README.md`):
+  `align_and_compare.py` (one command), `align_images.py` (alignment step),
+  `compare_yolo_objects.py` (detection, comparison, and marking step)
 - `setup_venv.sh` — creates `.venv` and installs `requirements.txt`
 - `with_*.jpg` / `without_*.jpg` — paired sample photos (chair, bag, bin,
   iron, stroller, and all items together)

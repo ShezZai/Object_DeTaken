@@ -116,12 +116,12 @@ def align_rows(rows, cache=None, max_side=640, verbose=True):
     """
     import contextlib
     import io
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pipeline"))
     try:
         from align_images import align_to_reference, largest_valid_rectangle
     except ImportError:
         raise SystemExit(
-            "error: --align needs align_images.py from the project root")
+            "error: --align needs align_images.py from the pipeline/ folder")
 
     def load(path):
         img = read_image(path, cache)
