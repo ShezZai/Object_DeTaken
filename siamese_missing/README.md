@@ -8,6 +8,7 @@ Two photos of a scene in, one boolean out: did anything go missing?
 |---|---|
 | `pairs_io.py` | Reads the folder tree into memory, synthesises reversed negatives, image cache, scene-grouped train/val split |
 | `train_missing.py` | **Main entry point.** `train` / `predict` / `evaluate`; `--keras` (EfficientNetB0, default, saves `kmodel.keras` + `.json` sidecar) or `--torch` (ResNet18, saves `model.pt`) |
+| `keras_flow.ipynb` | Self-contained notebook of the Keras flow — installs, downloads the dataset, trains, evaluates, visualizes; runs top to bottom on its own |
 | `missing_items.py` | Detector-diff baseline (YOLO). Standalone, no training |
 | `bootstrap_labels.py` | Optional: pre-label pairs with the detector so you hand-correct instead of annotating from scratch |
 | `requirements.txt` | Dependencies |
