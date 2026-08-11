@@ -8,12 +8,12 @@ tuned for a small dataset (200-500 pairs across 20-50 scenes).
     python train_missing.py evaluate --root holdout
 
 Two implementations behind one CLI, chosen per subcommand:
-    --torch (default)  ResNet18 encoder, saves fold<k>.pt
-    --keras            Keras 3 + EfficientNetB0, saves kfold<k>.keras plus a
-                       kfold<k>.json sidecar (threshold/metadata). Sets
+    --keras (default)  Keras 3 + EfficientNetB0, saves kmodel.keras plus a
+                       kmodel.json sidecar (threshold/metadata). Sets
                        KERAS_BACKEND=torch behind the scenes so the GPU works
                        wherever torch does; export KERAS_BACKEND yourself to
                        override (e.g. tensorflow on a supported GPU).
+    --torch            ResNet18 encoder, saves model.pt
 
 Reads the folder tree directly via pairs_io -- no manifest file, no generated
 folders. Reversed negatives are synthesised in memory.
@@ -40,7 +40,7 @@ import torch.nn as nn
 from sklearn.metrics import roc_auc_score, roc_curve
 from torch.utils.data import DataLoader, Dataset
 
-from pairs_io import ImageCache, load_pairs, scene_folds
+from pairs_io import ImageCache, load_pairs, scene_split
 
 # head activations shared by both implementations; keras takes the name
 # directly, torch needs the module.
@@ -289,11 +289,11 @@ def confusion(y, p, thr):
             int(((pred == 0) & (y == 1)).sum()), int(((pred == 0) & (y == 0)).sum()))
 
 
-def epoch_progress(fold, epoch, args, score, best, patience):
+def epoch_progress(epoch, args, score, best, patience):
     """Live one-line status: in-place on a terminal, one line per epoch when
     piped (logs, Colab) so progress stays visible either way."""
     name = getattr(args, "metric", "auc")
-    line = (f"fold {fold} epoch {epoch + 1}/{args.epochs} | "
+    line = (f"epoch {epoch + 1}/{args.epochs} | "
             f"val {name} {score:.3f} | best {best['score']:.3f} @ epoch "
             f"{best['epoch']} | patience {patience}/{args.patience}")
     if sys.stdout.isatty():
@@ -307,16 +307,10 @@ def epoch_progress_done():
         print("\r" + " " * 100 + "\r", end="", flush=True)
 
 
-# fixed per-fold line colors (colorblind-checked order; folds past 8 go gray
-# rather than reusing a hue that already names another fold)
-FOLD_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
-               "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
-
-
-def save_history_graph(path, results):
-    """Per-epoch validation AUC and accuracy, one panel per metric and one
-    line per fold; the dot on each line marks the epoch whose checkpoint was
-    kept. Accuracy is measured at each epoch's own selected threshold."""
+def save_history_graph(path, result):
+    """Per-epoch validation AUC and accuracy for the run; the dot on each
+    line marks the epoch whose checkpoint was kept. Accuracy is measured at
+    each epoch's own selected threshold."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -326,22 +320,19 @@ def save_history_graph(path, results):
               "(pip install matplotlib); skipping graph")
         return
 
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), sharex=True, sharey=True)
-    for ax, key, title in zip(axes, ("auc", "acc"),
-                              ("validation AUC", "validation accuracy")):
-        for k, r in enumerate(results):
-            curve = [h[key] for h in r["history"]]
-            color = FOLD_COLORS[k] if k < len(FOLD_COLORS) else "#8a8a86"
-            ax.plot(range(1, len(curve) + 1), curve, color=color,
-                    linewidth=2, label=f"fold {k}")
-            if 0 <= r["epoch"] < len(curve):
-                ax.plot(r["epoch"] + 1, curve[r["epoch"]], "o",
-                        color=color, markersize=6)
-        ax.set_title(title, fontsize=11)
-        ax.set_xlabel("epoch")
-        ax.grid(axis="y", color="#000000", alpha=0.08, linewidth=0.8)
-        ax.spines[["top", "right"]].set_visible(False)
-    axes[0].legend(frameon=False, fontsize=9)
+    fig, ax = plt.subplots(figsize=(7, 4.2))
+    for key, label, color in (("auc", "val AUC", "#2a78d6"),
+                              ("acc", "val accuracy", "#eb6834")):
+        curve = [h[key] for h in result["history"]]
+        ax.plot(range(1, len(curve) + 1), curve, color=color,
+                linewidth=2, label=label)
+        if 0 <= result["epoch"] < len(curve):
+            ax.plot(result["epoch"] + 1, curve[result["epoch"]], "o",
+                    color=color, markersize=6)
+    ax.set_xlabel("epoch")
+    ax.grid(axis="y", color="#000000", alpha=0.08, linewidth=0.8)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.legend(frameon=False, fontsize=9)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -418,8 +409,8 @@ def torch_grad_cam(model, row, size, device, cache=None, aligned=None):
 # --------------------------------------------------------------------------- #
 # training (torch)
 # --------------------------------------------------------------------------- #
-def train_fold(tr_rows, va_rows, args, device, fold, cache, aligned=None):
-    seed_all(args.seed + fold)
+def train_model(tr_rows, va_rows, args, device, cache, aligned=None):
+    seed_all(args.seed)
     size = (args.height, args.width)
     flip = args.flip
     workers = 0 if cache is not None else args.workers
@@ -473,7 +464,7 @@ def train_fold(tr_rows, va_rows, args, device, fold, cache, aligned=None):
         else:
             patience += 1
 
-        epoch_progress(fold, epoch, args, score, best, patience)
+        epoch_progress(epoch, args, score, best, patience)
         if patience >= args.patience:
             break
 
@@ -483,7 +474,7 @@ def train_fold(tr_rows, va_rows, args, device, fold, cache, aligned=None):
     tp, fp, fn, tn = confusion(y, p, best["thr"])
     acc = (tp + tn) / max(len(y), 1)
 
-    path = f"{args.prefix}{fold}.pt"
+    path = f"{args.prefix}.pt"
     torch.save({"model": best["state"], "backbone": args.backbone, "size": size,
                 "threshold": best["thr"], "val_auc": best["auc"],
                 "dropout": args.dropout, "hidden": args.hidden,
@@ -609,13 +600,13 @@ def keras_impl():
             ys.append(y)
         return np.concatenate(ps), np.concatenate(ys)
 
-    def k_train_fold(tr_rows, va_rows, args, fold, cache, aligned=None):
-        keras.utils.set_random_seed(args.seed + fold)
+    def k_train_model(tr_rows, va_rows, args, cache, aligned=None):
+        keras.utils.set_random_seed(args.seed)
         size = (args.height, args.width)
         flip = args.flip
 
         tr = PairSequence(tr_rows, size, True, cache, args.bs,
-                          seed=args.seed + fold, aligned=aligned, flip=flip)
+                          seed=args.seed, aligned=aligned, flip=flip)
         va = PairSequence(va_rows, size, False, cache, args.bs,
                           shuffle=False, aligned=aligned, flip=flip)
 
@@ -649,7 +640,7 @@ def keras_impl():
             else:
                 patience += 1
 
-            epoch_progress(fold, epoch, args, score, best, patience)
+            epoch_progress(epoch, args, score, best, patience)
             if patience >= args.patience:
                 break
 
@@ -659,9 +650,9 @@ def keras_impl():
         tp, fp, fn, tn = confusion(y, p, best["thr"])
         acc = (tp + tn) / max(len(y), 1)
 
-        path = f"{args.prefix}{fold}.keras"
+        path = f"{args.prefix}.keras"
         model.save(path)
-        Path(f"{args.prefix}{fold}.json").write_text(json.dumps({
+        Path(f"{args.prefix}.json").write_text(json.dumps({
             "size": [args.height, args.width], "threshold": best["thr"],
             "val_auc": best["auc"], "backbone": "efficientnetb0",
             "dropout": args.dropout, "hidden": args.hidden,
@@ -730,7 +721,7 @@ def keras_impl():
 
     from types import SimpleNamespace
     _KERAS_IMPL = SimpleNamespace(
-        train_fold=k_train_fold, load_ensemble=k_load_ensemble,
+        train_model=k_train_model, load_ensemble=k_load_ensemble,
         pair_prob=k_pair_prob, grad_cam=k_grad_cam,
     )
     return _KERAS_IMPL
@@ -741,9 +732,9 @@ def keras_impl():
 # --------------------------------------------------------------------------- #
 def resolve_defaults(args):
     if getattr(args, "prefix", None) is None:
-        args.prefix = "kfold" if args.keras else "fold"
+        args.prefix = "kmodel" if args.keras else "model"
     if getattr(args, "ckpt", None) is None:
-        args.ckpt = "kfold*.keras" if args.keras else "fold*.pt"
+        args.ckpt = "kmodel*.keras" if args.keras else "model*.pt"
 
 
 def cmd_train(args):
@@ -761,8 +752,8 @@ def cmd_train(args):
         challenge = load_pairs(args.challenge_root,
                                reverse_positives=args.reverse,
                                identity_negatives=args.identity_negatives)
-        # Same physical location must stay one scene for fold grouping:
-        # match challenge scenes to training scenes by their base name.
+        # Same physical location must stay one scene for the scene-held-out
+        # split: match challenge scenes to training scenes by their base name.
         by_base = {r["scene"].split("/")[-1]: r["scene"] for r in rows}
         unmatched = set()
         for r in challenge:
@@ -781,39 +772,30 @@ def cmd_train(args):
         for s in sorted(unmatched):
             print(f"  note: challenge scene {s} matches no training scene -- "
                   f"if it is the same physical location under another name, "
-                  f"folds may leak it")
+                  f"the split may leak it")
 
     cache = ImageCache(args.cache_side).warm(rows) if args.cache else None
     aligned = align_rows(rows, cache) if args.align else None
     print()
 
-    results = []
-    for k, (tr_rows, va_rows) in enumerate(
-            scene_folds(rows, args.folds, args.seed, args.val_fraction)):
-        # identity negatives are train-only: without augmentation they are
-        # pixel-identical and would flatter validation
-        va_rows = [r for r in va_rows if not r.get("identity", False)]
-        if args.keras:
-            r = impl.train_fold(tr_rows, va_rows, args, k, cache, aligned)
-        else:
-            r = train_fold(tr_rows, va_rows, args, device, k, cache, aligned)
-        results.append(r)
-        print(f"fold {k}: {r['n_val']:3d} val pairs | AUC {r['auc']:.3f} | "
-              f"acc {r['acc']:.3f} | TP {r['tp']} FP {r['fp']} FN {r['fn']} "
-              f"TN {r['tn']} | best epoch {r['epoch']}")
+    tr_rows, va_rows = scene_split(rows, args.seed, args.val_fraction)
+    # identity negatives are train-only: without augmentation they are
+    # pixel-identical and would flatter validation
+    va_rows = [r for r in va_rows if not r.get("identity", False)]
+    if args.keras:
+        r = impl.train_model(tr_rows, va_rows, args, cache, aligned)
+    else:
+        r = train_model(tr_rows, va_rows, args, device, cache, aligned)
+    print(f"{r['n_val']:3d} val pairs | AUC {r['auc']:.3f} | "
+          f"acc {r['acc']:.3f} | TP {r['tp']} FP {r['fp']} FN {r['fn']} "
+          f"TN {r['tn']} | best epoch {r['epoch']}")
 
-    aucs = np.array([r["auc"] for r in results])
-    accs = np.array([r["acc"] for r in results])
-    suffix = "keras" if args.keras else "pt"
     if args.graph:
         save_history_graph(args.graph if isinstance(args.graph, str)
-                           else f"{args.prefix}curves.png", results)
-    print(f"\nAUC {aucs.mean():.3f} +/- {aucs.std():.3f}"
-          f"   acc {accs.mean():.3f} +/- {accs.std():.3f}")
-    print(f"checkpoints: {args.prefix}0.{suffix} ... "
-          f"{args.prefix}{args.folds - 1}.{suffix}")
-    print("read the spread as well as the mean -- at this data size one lucky "
-          "fold can carry the average")
+                           else f"{args.prefix}curves.png", r)
+    print(f"\ncheckpoint: {r['path']}")
+    print("validation is one scene-held-out subset -- rerun with other "
+          "--seed values to gauge how much the score moves")
 
 
 # --------------------------------------------------------------------------- #
@@ -966,11 +948,11 @@ def main():
     backend = argparse.ArgumentParser(add_help=False)
     group = backend.add_mutually_exclusive_group()
     group.add_argument("--keras", action="store_true",
-                       help="Keras implementation (EfficientNetB0); sets "
-                            "KERAS_BACKEND=torch unless already set")
+                       help="Keras implementation (EfficientNetB0, default); "
+                            "sets KERAS_BACKEND=torch unless already set")
     group.add_argument("--torch", dest="keras", action="store_false",
-                       help="PyTorch implementation (ResNet18, default)")
-    backend.set_defaults(keras=False)
+                       help="PyTorch implementation (ResNet18)")
+    backend.set_defaults(keras=True)
     backend.add_argument("--device", default=None,
                          help="cuda | cpu | mps (torch implementation only)")
     backend.add_argument("--config", default=None,
@@ -991,17 +973,14 @@ def main():
     t.add_argument("--challenge-root", "--challenge_root", default=None,
                    help="extra folder of harder training pairs (e.g. "
                         "../somethings_missing_here/challenging/training); "
-                        "scenes matching a training scene by name share its "
-                        "fold")
+                        "scenes matching a training scene by name stay on "
+                        "its side of the split")
     t.add_argument("--backbone", default="resnet18",
                    help="timm model name (torch only; keras always uses "
                         "EfficientNetB0)")
-    t.add_argument("--folds", type=int, default=5,
-                   help="cross-validation folds; 1 = single train/val split "
-                        "(see --val-fraction), training one model")
     t.add_argument("--val-fraction", type=float, default=0.2,
-                   help="with --folds 1: fraction of rows held out (whole "
-                        "scenes) for validation (default: 0.15)")
+                   help="fraction of rows held out (whole scenes) for "
+                        "validation (default: 0.2)")
     t.add_argument("--epochs", type=int, default=60)
     t.add_argument("--freeze-epochs", type=int, default=10)
     t.add_argument("--patience", type=int, default=15)
@@ -1020,7 +999,7 @@ def main():
     t.add_argument("--width", type=int, default=256)
     t.add_argument("--seed", type=int, default=42)
     t.add_argument("--prefix", default=None,
-                   help="checkpoint prefix (default: fold / kfold)")
+                   help="checkpoint name prefix (default: model / kmodel)")
     t.add_argument("--workers", type=int, default=2)
     t.add_argument("--cache", action="store_true", help="decode images once into RAM")
     t.add_argument("--align", action="store_true",
@@ -1029,9 +1008,8 @@ def main():
     t.add_argument("--cache-side", type=int, default=640)
     t.add_argument("--graph", nargs="?", const=True, default=None,
                    metavar="FILE",
-                   help="plot per-epoch validation AUC and accuracy for every "
-                        "fold to FILE (default: <prefix>curves.png); needs "
-                        "matplotlib")
+                   help="plot per-epoch validation AUC and accuracy to FILE "
+                        "(default: <prefix>curves.png); needs matplotlib")
     t.add_argument("--reverse", action="store_true",
                    help="add a swapped-order negative per positive (a removal "
                         "read backwards is an addition); off by default")
@@ -1042,7 +1020,8 @@ def main():
 
     p = sub.add_parser("predict", parents=[backend])
     p.add_argument("--ckpt", default=None,
-                   help="checkpoint glob (default: fold*.pt / kfold*.keras)")
+                   help="checkpoint glob (default: model*.pt / kmodel*.keras); "
+                        "several matches are averaged as an ensemble")
     p.add_argument("--before", default=None, help="required (flag or config)")
     p.add_argument("--after", default=None, help="required (flag or config)")
     p.set_defaults(func=cmd_predict)
@@ -1051,7 +1030,8 @@ def main():
     e.add_argument("--root", default=None,
                    help="held-out folder, same layout; required (flag or config)")
     e.add_argument("--ckpt", default=None,
-                   help="checkpoint glob (default: fold*.pt / kfold*.keras)")
+                   help="checkpoint glob (default: model*.pt / kmodel*.keras); "
+                        "several matches are averaged as an ensemble")
     e.add_argument("--cache", action="store_true")
     e.add_argument("--align", action="store_true",
                    help="ECC-align each pair before evaluation (use when the "

@@ -1,12 +1,88 @@
 # Object DeTaken
 
-Find objects that appear in one photo but are missing from another photo of the
-same scene — for example, spotting which item was taken from a room by
-comparing a "before" and "after" picture.
+A project by **Shay Gil** and **Michal Peri Markov**.
 
-The pipeline aligns the two photos, detects objects with YOLO, finds changed
-regions by image differencing, and marks every object from picture 1 that has
-no counterpart in picture 2.
+Given two photos of the same scene — a "before" and an "after" — decide
+whether something went missing, and point at what was taken.
+
+## Motivation
+
+Spotting that an object disappeared sounds trivial (subtract the images?)
+but is not: the two photos are taken from slightly different viewpoints,
+under different lighting, sometimes hours apart. A useful detector must
+ignore camera shift, exposure, and shadows, yet still fire on a missing
+cup — and must *not* fire when things merely moved. The removed-object case
+matters wherever a space is handed over and checked: rentals, offices,
+labs, exhibitions, care settings ("who took the phone?").
+
+The project attacks the problem twice, with a purpose-built dataset:
+
+1. a **classical pipeline** — no training, works out of the box;
+2. a **learned siamese model** — trained to answer "did anything go
+   missing?" directly.
+
+## The dataset
+
+[`Shay85Gil/somethings_missing_here`](https://huggingface.co/datasets/Shay85Gil/somethings_missing_here)
+— 559 viewpoint-aligned before/after pairs with labels naming the removed
+items: 350 training and 116 held-out test pairs across 40 scenes, plus a
+93-pair `challenging` split (swaps, replacements, rearrangements) where
+"things changed" must be told apart from "something is gone". Original
+photographs by the authors plus pairs derived from
+[Remove360](https://huggingface.co/datasets/simkoc/Remove360). Test pairs
+contain no synthetic imagery. `download_dataset.py` fetches it into
+`somethings_missing_here/`.
+
+## The detection pipeline (`pipeline/`)
+
+Classical computer vision, one command:
+
+```bash
+python pipeline/align_and_compare.py before.jpg after.jpg -o unique_objects.jpg
+```
+
+It ECC-aligns the pair, detects objects with YOLO11 and adds
+label-independent candidates from image differencing, keeps picture-1
+boxes with no overlapping counterpart and no template match in picture 2,
+and names the survivors with an ImageNet classifier. On the dataset's test
+split it flags 95 of 97 removals with 12 false alarms on 19 no-change
+pairs (pair-level accuracy 0.88, recall 0.98) — high recall, but noisy on
+scenes that merely shifted, and its object *names* are limited by the
+ImageNet vocabulary. Details, options, and per-step usage:
+[`pipeline/README.md`](pipeline/README.md).
+
+## The learned model (`siamese_missing/`)
+
+A siamese binary classifier (`train_missing.py`): one shared pretrained
+encoder embeds both photos, and a small head reads
+`[f_before, f_after, f_before − f_after]` — the *signed* difference, so
+removal and addition are distinguishable. Training holds out whole scenes
+for validation (a scene never appears in both train and validation), uses
+heavy shared-geometry/independent-photometry augmentation, and picks the
+decision threshold on validation (Youden's J); at inference every
+checkpoint matching a glob is averaged, so multi-seed ensembles come free.
+Two interchangeable implementations behind one CLI: Keras 3 +
+EfficientNetB0 (`--keras`, the default) and PyTorch + ResNet18 (`--torch`).
+
+**The best results came from the Keras/EfficientNetB0 implementation** —
+which is why it is the default.
+Other lessons the experiments taught us, mostly the hard way:
+
+- **Seed variance dominates.** The identical configuration scored test
+  AUC 0.93 with one seed and 0.73 with another — bigger than any single
+  hyperparameter effect we measured. Conclusions need multi-seed runs;
+  single-run comparisons at this dataset size (hundreds of pairs) mostly
+  compare luck.
+- **Validation can stop tracking the real task.** Adding reversed-pair
+  negatives (`--reverse`) raises validation AUC while changing what
+  validation measures; the held-out natural test pairs are the only
+  arbiter, which is why `evaluate` refuses to score reversals.
+- **Fine-tuning the encoder is fragile on this data size** — freezing it
+  avoids sudden post-unfreeze collapses, and the per-epoch `--graph`
+  curves make that failure mode visible.
+
+Training, prediction, evaluation, and Grad-CAM visualization are
+documented in [`siamese_missing/README.md`](siamese_missing/README.md).
 
 ## Setup
 
@@ -26,69 +102,17 @@ py setup_venv.py
 .venv\Scripts\Activate.ps1
 ```
 
-The script creates a `.venv` virtual environment and installs the dependencies
-from `requirements.txt` (NumPy, OpenCV, Pillow, Ultralytics). YOLO model
-weights (`yolo11n.pt`, `yolo11n-cls.pt`) are downloaded automatically by
-Ultralytics on first run.
-
-## Usage
-
-### Full pipeline (recommended)
-
-Align the two pictures, then detect and mark objects unique to picture 1:
-
-```bash
-python pipeline/align_and_compare.py with_chair.jpg without_chair.jpg -o unique_objects.jpg
-```
-
-Useful options:
-
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `-o`, `--output` | `unique_objects.jpg` | marked output image |
-| `--overlap` | `0.15` | IoU below which a picture-1 object counts as missing from picture 2 |
-| `--confidence` | `0.25` | minimum YOLO detection confidence |
-| `--pattern-threshold` | `0.50` | template-match similarity below which a crop counts as absent |
-| `--difference-min-area` | `0.001` | minimum changed-region size as a fraction of the image |
-| `--alignment-max-size` | `800` | thumbnail size used to estimate alignment |
-| `--keep-aligned` | off | keep the intermediate `<stem>_aligned` images |
-
-### Individual steps
-
-Align picture 1 to picture 2 and save both cropped to their shared valid area:
-
-```bash
-python pipeline/align_images.py with_chair.jpg without_chair.jpg
-```
-
-Compare two already-aligned pictures:
-
-```bash
-python pipeline/compare_yolo_objects.py with_chair_aligned.jpg without_chair_aligned.jpg
-```
-
-## How it works
-
-1. **Alignment** (`pipeline/align_images.py`) — estimates an affine transform with
-   OpenCV ECC on downscaled copies, warps picture 1 into picture 2's
-   coordinate system, and crops both to the largest rectangle of shared valid
-   pixels.
-2. **Detection** (`pipeline/compare_yolo_objects.py`) — runs a YOLO detector on both
-   pictures, and adds label-independent candidate boxes from thresholded image
-   differences so objects YOLO misses can still be flagged.
-3. **Filtering** — a picture-1 box is kept only if it has no overlapping box
-   in picture 2 (IoU below `--overlap`) *and* its crop cannot be found
-   anywhere in picture 2 by template matching (below `--pattern-threshold`).
-4. **Recognition** — surviving crops are classified with a YOLO
-   classification model, and the result is drawn on picture 1 with red boxes
-   and labels showing the recognized category, confidence, overlap, and
-   pattern similarity.
+The script creates a `.venv` virtual environment and installs
+`requirements.txt`. YOLO model weights (`yolo11n.pt`, `yolo11n-cls.pt`)
+are downloaded automatically by Ultralytics on first run.
 
 ## Files
 
-- `pipeline/` — the alignment + detection pipeline (see `pipeline/README.md`):
-  `align_and_compare.py` (one command), `align_images.py` (alignment step),
-  `compare_yolo_objects.py` (detection, comparison, and marking step)
-- `setup_venv.sh` — creates `.venv` and installs `requirements.txt`
-- `with_*.jpg` / `without_*.jpg` — paired sample photos (chair, bag, bin,
-  iron, stroller, and all items together)
+- `pipeline/` — the classical alignment + detection pipeline
+  (see `pipeline/README.md`)
+- `siamese_missing/` — the trainable siamese model
+  (see `siamese_missing/README.md`)
+- `download_dataset.py` — fetch the dataset from Hugging Face
+- `make_crop_negatives.py` — generate crop-shift no-change pairs
+  (training splits only)
+- `setup_venv.sh` / `setup_venv.py` — environment setup
