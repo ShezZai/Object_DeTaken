@@ -1,6 +1,6 @@
 # Object DeTaken
 
-A project by **Shay Gil** and **Michal Peri Markov**.
+A project by **Shay Gil** and **Michal Peri Markovich**.
 
 Given two photos of the same scene — a "before" and an "after" — decide
 whether something went missing, and point at what was taken.
