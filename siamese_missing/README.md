@@ -7,7 +7,8 @@ Two photos of a scene in, one boolean out: did anything go missing?
 | File | Role |
 |---|---|
 | `pairs_io.py` | Reads the folder tree into memory, synthesises reversed negatives, image cache, scene-grouped train/val split |
-| `train_missing.py` | **Main entry point.** `train` / `predict` / `evaluate`; `--keras` (EfficientNetB0, default, saves `kmodel.keras` + `.json` sidecar) or `--torch` (ResNet18, saves `model.pt`) |
+| `train_missing.py` | **Main entry point.** `train` / `predict` / `evaluate`; `--keras` (EfficientNetB0, default, saves `kmodel.keras` + `.json` sidecar) , `--torch` (ResNet18, saves `model.pt`), or `--vit` (DINOv2 ViT, saves `vmodel.pt`) |
+| `Vit_siamese.py` | The `--vit` model: frozen DINOv2 patch tokens, before→after cross-attention, per-patch "gone" scores |
 | `keras_flow.ipynb` | Self-contained notebook of the Keras flow — installs, downloads the dataset, trains, evaluates, visualizes; runs top to bottom on its own |
 | `missing_items.py` | Detector-diff baseline (YOLO). Standalone, no training |
 | `bootstrap_labels.py` | Optional: pre-label pairs with the detector so you hand-correct instead of annotating from scratch |
@@ -92,8 +93,8 @@ python train_missing.py train --root ../somethings_missing_here/training --cache
 ```
 
 Predict on one new pair (hflip TTA with `--flip`; every checkpoint matching
-`--ckpt` is averaged, so several runs — e.g. different seeds — form an
-ensemble):
+`--ckpt` is averaged — logits and thresholds both, in logit space — so
+several runs, e.g. different seeds, form an ensemble):
 
 ```bash
 python train_missing.py predict --before a.jpg --after b.jpg
@@ -121,6 +122,24 @@ implementation is one flag away and saves `model.pt`:
 ```bash
 python train_missing.py train --torch --root data --cache
 python train_missing.py predict --torch --before a.jpg --after b.jpg
+```
+
+`--vit` (torch-only, saves `vmodel.pt`) swaps the pooled-feature CNN for
+`Vit_siamese.py`: a frozen DINOv2 ViT-S/14 keeps its patch tokens, every
+*before* patch looks for itself among the *after* patches via
+cross-attention, and a small transformer scores each before-patch as
+"gone". The pair logit is a smooth max over those scores, so a single
+unexplained patch is enough — the point for small objects that global
+pooling dilutes. Defaults change with it: backbone
+`vit_small_patch14_dinov2.lvd142m`, 224×224 (use multiples of 14), and the
+encoder is never unfrozen unless you pass `--freeze-epochs`. With
+`evaluate --viz`, the panels show the model's own trained patch scores
+instead of Grad-CAM (absolute scale: a dark map means no patch was
+confident).
+
+```bash
+python train_missing.py train --vit --root data --cache
+python train_missing.py evaluate --vit --root holdout --cache --viz viz
 ```
 
 Any invocation can live in a JSON config instead of flags — keys mirror the
@@ -157,12 +176,12 @@ python bootstrap_labels.py data
 |---|---|---|
 | `--cache` | off | Turn it on. Decodes each image once into RAM; often 3–5× faster since JPEG decode is the real bottleneck |
 | `--cache-side` | 640 | Lower to 384 if RAM is tight (~1.2 GB at 640 for 500 pairs) |
-| `--height/--width` | 256 | Raise to 384 if items are small in frame. Halve `--bs` if you hit OOM |
-| `--backbone` | `resnet18` | `resnet34` above ~1000 pairs. `convnext_tiny` needs 12 GB+ |
+| `--height/--width` | 256 (224 with `--vit`) | Raise to 384 if items are small in frame. Halve `--bs` if you hit OOM |
+| `--backbone` | `resnet18` | `resnet34` above ~1000 pairs. `convnext_tiny` needs 12 GB+. With `--vit`: `vit_small_patch14_dinov2.lvd142m`; `vit_base_patch14_dinov2.lvd142m` is the bigger option |
 | `--bs` | 16 | Lower on small GPUs; the head uses LayerNorm so small batches are safe |
 | `--val-fraction` | 0.2 | Fraction of rows (whole scenes) held out for validation |
 | `--dropout` | 0.4 | Raise to 0.5–0.6 if train/val AUC diverge |
-| `--freeze-epochs` | 10 | Raise under ~250 pairs; the frozen encoder is doing most of the work |
+| `--freeze-epochs` | 10 (never with `--vit`) | Raise under ~250 pairs; the frozen encoder is doing most of the work |
 | `--no-reverse` | off | Only if you already materialised reversals on disk |
 
 ## Reading the output
@@ -193,7 +212,8 @@ outside COCO's 80 classes.
 - **Reversed positives as negatives.** A removal read backwards is an addition. Doubles the data, balances the classes, and forces the model to use that sign.
 - **Geometric augmentation shared, photometric independent.** Independent brightness/colour jitter is what teaches "the light changed" ≠ "the item is gone".
 - **Frozen encoder stays in `eval()`** so ImageNet BatchNorm running statistics survive fine-tuning on a few hundred images.
-- **Threshold from Youden's J** on the validation split, stored in the checkpoint — not a hardcoded 0.5.
+- **Threshold from Youden's J** on the validation split, stored in the checkpoint — not a hardcoded 0.5. It is the middle (in logit space) of the range of cutoffs that all reach the best J, not the edge of it: when validation separates cleanly, the edge is an arbitrary validation score and does not transfer.
+- **Platt scaling** is stored alongside it (a logistic fit of the logit on validation with Platt's smoothed targets, moved to the training data's base rate). `--calibration platt|threshold` picks the rule at `predict`/`evaluate`; the default is `platt` with `--vit` and `threshold` otherwise — over 5 seeds Platt helped the ViT and hurt Keras, whose validation AUC is near chance on some seeds (see the top-level README). `--prior 0.8` moves the Platt decision to a known deployment rate of removals. Checkpoints trained before this can be calibrated without retraining: `python train_missing.py calibrate --vit --root data --seed 42 --ckpt vmodel.pt` (newer checkpoints store their seed and split settings, so `--seed` is not needed).
 
 ## Troubleshooting
 

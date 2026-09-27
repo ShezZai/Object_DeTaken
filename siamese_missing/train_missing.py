@@ -14,6 +14,8 @@ Two implementations behind one CLI, chosen per subcommand:
                        wherever torch does; export KERAS_BACKEND yourself to
                        override (e.g. tensorflow on a supported GPU).
     --torch            ResNet18 encoder, saves model.pt
+    --vit              frozen DINOv2 ViT patch tokens + cross-attention
+                       (Vit_siamese.py), saves vmodel.pt; torch-only
 
 Reads the folder tree directly via pairs_io -- no manifest file, no generated
 folders. Reversed negatives are synthesised in memory.
@@ -37,7 +39,7 @@ import numpy as np
 import timm
 import torch
 import torch.nn as nn
-from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Dataset
 
 from pairs_io import ImageCache, load_pairs, scene_split
@@ -72,7 +74,7 @@ def build_transforms(size, train, flip=False):
     jitter      -> small extra warp on `after` only, for registration slack
 
     flip=True adds a horizontal flip (and its test-time counterpart, see
-    pair_prob). Off by default: left-right orientation is meaningful in
+    pair_logit). Off by default: left-right orientation is meaningful in
     these scenes, and mirroring can cost more than the 2x data gains.
     """
     h, w = size
@@ -243,25 +245,143 @@ class SiameseBool(nn.Module):
             self.enc.eval()
 
 
+def build_torch_model(arch, backbone, pretrained=True, **kw):
+    """arch "cnn" -> SiameseBool (pooled features), "vit" -> SiameseViT
+    (patch tokens + cross-attention, see Vit_siamese.py)."""
+    if arch == "vit":
+        from Vit_siamese import SiameseViT
+        return SiameseViT(backbone, pretrained=pretrained, **kw)
+    return SiameseBool(backbone, pretrained=pretrained, **kw)
+
+
 # --------------------------------------------------------------------------- #
 # evaluation helpers (shared)
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
-def probs_and_labels(model, loader, device):
+def logits_and_labels(model, loader, device):
     model.eval()
-    ps, ys = [], []
+    zs, ys = [], []
     for a, b, y in loader:
-        ps.append(torch.sigmoid(model(a.to(device), b.to(device))).cpu().numpy())
+        zs.append(model(a.to(device), b.to(device)).cpu().numpy())
         ys.append(y.numpy())
-    return np.concatenate(ps), np.concatenate(ys)
+    return np.concatenate(zs), np.concatenate(ys)
+
+
+def logit(p):
+    p = np.clip(np.asarray(p, dtype=float), 1e-6, 1 - 1e-6)
+    return np.log(p) - np.log1p(-p)
+
+
+def sigmoid(z):
+    return 1.0 / (1.0 + np.exp(-np.asarray(z, dtype=float)))
+
+
+def plateau_cutoff(p, score):
+    """Middle (in logit space) of the range of cutoffs that all reach the
+    best `score`, where score[k] is the metric of the cutoff p >= u[k] and u
+    are the unique predictions, ascending.
+
+    Taking the first maximiser instead (roc_curve's argmax) cuts exactly at
+    a validation prediction, which is arbitrary when validation separates
+    well: any cutoff inside the gap between classes is equally good, and the
+    edge of the gap is the least robust of them (seeds of the same run
+    landed at 0.89 and 0.01). The middle of the gap is a max-margin cutoff.
+    """
+    u = np.unique(p)
+    best = np.flatnonzero(score >= score.max() - 1e-9)
+    # cutoff u[k] means "p >= u[k]": equivalent cutoffs lie in (u[k-1], u[k]]
+    lo = u[best[0] - 1] if best[0] > 0 else u[0]
+    hi = u[best[-1]]
+    return float(np.clip(sigmoid((logit(lo) + logit(hi)) / 2), 0.01, 0.99))
+
+
+def fit_platt(z, y):
+    """Platt scaling: fit P(missing | z) = sigmoid(a*z + b) on validation
+    logits z, with Platt's smoothed targets (N+ + 1)/(N+ + 2) and
+    1/(N- + 2) instead of 1/0.
+
+    The smoothing is what makes this usable on ~75 validation pairs: when
+    validation separates perfectly, plain 0/1 targets drive a -> infinity
+    and the decision point back onto two individual pairs at the edge of
+    the gap. Smoothed targets keep the fit finite, so the whole spread of
+    validation scores sets the scale. Newton's method with step halving
+    (the objective is convex). Returns (a, b).
+    """
+    z, y = np.asarray(z, dtype=float), np.asarray(y, dtype=float)
+    n_pos, n_neg = y.sum(), len(y) - y.sum()
+    t = np.where(y == 1, (n_pos + 1) / (n_pos + 2), 1 / (n_neg + 2))
+
+    def loss(a, b):
+        u = a * z + b                      # stable soft-target cross-entropy
+        return float(np.sum(np.logaddexp(0, u) - t * u))
+
+    a, b = 1.0, 0.0
+    for _ in range(100):
+        q = sigmoid(a * z + b)
+        g = np.array([np.sum((q - t) * z), np.sum(q - t)])
+        w = q * (1 - q)
+        h = np.array([[np.sum(w * z * z), np.sum(w * z)],
+                      [np.sum(w * z), np.sum(w)]]) + 1e-9 * np.eye(2)
+        step = np.linalg.solve(h, g)
+        cur, lr = loss(a, b), 1.0
+        while lr > 1e-6 and loss(a - lr * step[0], b - lr * step[1]) > cur:
+            lr /= 2
+        a, b = a - lr * step[0], b - lr * step[1]
+        if np.abs(lr * step).max() < 1e-9:
+            break
+    return float(a), float(b)
+
+
+def make_calibration(z, y, pos_rate, threshold):
+    """Everything inference needs to turn this model's raw logit into a
+    decision (see decision_logit). `threshold` (Youden) is kept for
+    reference and for tools that predate calibration."""
+    y = np.asarray(y, dtype=float)
+    return {"platt": list(fit_platt(z, y)),
+            "val_pos_rate": float(y.mean()),
+            "pos_rate": float(pos_rate),
+            "threshold": float(threshold)}
+
+
+def decision_logit(z, calib, prior=None, mode="platt"):
+    """A model's raw logit -> calibrated log-odds of 'missing' under the
+    reference base rate; the decision is > 0 (probability > 0.5), and an
+    ensemble averages these, so members with different logit scales vote
+    on one scale.
+
+    Platt fits P(missing) at the VALIDATION base rate, which swings with
+    the split (15/75 to 38/74 removals here); it is moved to `prior`, by
+    default the base rate of all the training data, with the usual
+    log-odds shift. Pass the removal rate you expect in deployment as
+    `prior` -- a removal-heavy set needs a lower bar.
+
+    mode="threshold" (and checkpoints without Platt parameters) cut at the
+    stored validation threshold instead: z - logit(threshold) > 0. That is
+    the better choice for weak models (see --calibration): per-model Platt
+    trusts validation, and a model whose validation AUC is near chance gets
+    a near-zero slope and answers "no change" to everything, even when it
+    ranks new pairs well.
+    """
+    if mode == "threshold" or "platt" not in calib:
+        return z - logit(calib["threshold"])
+    a, b = calib["platt"]
+    ref = calib["pos_rate"] if prior is None else prior
+    return a * z + b - logit(calib["val_pos_rate"]) + logit(ref)
+
+
+def cutoff_scores(y, p, fn):
+    """fn(pred) for every distinct cutoff p >= u[k], u ascending."""
+    return np.array([fn(p >= t) for t in np.unique(p)])
 
 
 def best_threshold(y, p):
-    """Youden's J: maximise TPR - FPR. Beats a fixed 0.5 on imbalanced data."""
+    """Youden's J: maximise TPR - FPR. Beats a fixed 0.5 on imbalanced data.
+    Returns the middle of the best-J plateau (see plateau_cutoff)."""
     if len(set(y)) < 2:
         return 0.5
-    fpr, tpr, thr = roc_curve(y, p)
-    return float(np.clip(thr[np.argmax(tpr - fpr)], 0.01, 0.99))
+    pos, neg = y == 1, y == 0
+    j = cutoff_scores(y, p, lambda pred: pred[pos].mean() - pred[neg].mean())
+    return plateau_cutoff(p, j)
 
 
 def val_metric(name, y, p):
@@ -275,10 +395,8 @@ def val_metric(name, y, p):
     if name == "acc":
         if len(set(y)) < 2:
             return float(((p > 0.5) == (y == 1)).mean()), 0.5
-        _, _, thr = roc_curve(y, p)
-        accs = np.array([((p > t) == (y == 1)).mean() for t in thr])
-        i = int(accs.argmax())
-        return float(accs[i]), float(np.clip(thr[i], 0.01, 0.99))
+        accs = cutoff_scores(y, p, lambda pred: (pred == (y == 1)).mean())
+        return float(accs.max()), plateau_cutoff(p, accs)
     auc = roc_auc_score(y, p) if len(set(y)) > 1 else float("nan")
     return auc, best_threshold(y, p)
 
@@ -360,8 +478,31 @@ def save_cam_panel(path, before_rgb, after_rgb, cam_before, cam_after, caption):
     cv2.imwrite(str(path), np.vstack([strip, panel])[..., ::-1])
 
 
+def denorm(t):
+    img = (t[0].cpu() * STD + MEAN).clamp(0, 1) * 255
+    return img.permute(1, 2, 0).numpy().astype(np.uint8)
+
+
+@torch.no_grad()
+def vit_patch_map(model, a, b):
+    """SiameseViT's own per-patch scores as a [0,1] heatmap -- trained by
+    the classification loss, so no gradients needed. Each patch shows
+    sigmoid(score - log N): roughly the pair probability that patch alone
+    would produce. The same map (a before-patch location) goes on both
+    panels: on `after` it marks where the missing thing should have been."""
+    _, s = model(a, b, return_map=True)
+    h, w = a.shape[-2:]
+    gh, gw, (ph, pw) = model.patch_grid(h, w)
+    cam = torch.sigmoid(s[0] - np.log(s.shape[1])).view(gh, gw).cpu().numpy()
+    # the grid covers the right/bottom-padded input: upsample, then crop
+    cam = cv2.resize(cam, (gw * pw, gh * ph),
+                     interpolation=cv2.INTER_NEAREST)[:h, :w]
+    return cam, cam
+
+
 def torch_grad_cam(model, row, size, device, cache=None, aligned=None):
-    """Grad-CAM of the 'missing' logit at the encoder's last spatial layer.
+    """Grad-CAM of the 'missing' logit at the encoder's last spatial layer
+    (SiameseViT: its trained patch map instead, see vit_patch_map).
 
     Returns (before_rgb, after_rgb, cam_before, cam_after): the network's
     actual inputs (denormalized) and one [0,1] heatmap per branch.
@@ -369,6 +510,8 @@ def torch_grad_cam(model, row, size, device, cache=None, aligned=None):
     ds = PairSet([row], size, train=False, cache=cache, aligned=aligned)
     a, b, _ = ds[0]
     a, b = a[None].to(device), b[None].to(device)
+    if hasattr(model, "patch_grid"):
+        return (denorm(a), denorm(b)) + vit_patch_map(model, a, b)
 
     # find the last leaf module that outputs a spatial map
     spatial = []
@@ -399,17 +542,14 @@ def torch_grad_cam(model, row, size, device, cache=None, aligned=None):
         cam = torch.relu((weight * act).sum(1)).squeeze(0)
         cams.append((cam / (cam.max() + 1e-8)).detach().cpu().numpy())
 
-    def denorm(t):
-        img = (t[0].cpu() * STD + MEAN).clamp(0, 1) * 255
-        return img.permute(1, 2, 0).numpy().astype(np.uint8)
-
     return denorm(a), denorm(b), cams[0], cams[1]
 
 
 # --------------------------------------------------------------------------- #
 # training (torch)
 # --------------------------------------------------------------------------- #
-def train_model(tr_rows, va_rows, args, device, cache, aligned=None):
+def train_model(tr_rows, va_rows, args, device, cache, aligned=None,
+                pos_rate=0.5):
     seed_all(args.seed)
     size = (args.height, args.width)
     flip = args.flip
@@ -422,9 +562,10 @@ def train_model(tr_rows, va_rows, args, device, cache, aligned=None):
                     batch_size=args.bs,
                     num_workers=workers)
 
-    model = SiameseBool(args.backbone, p_drop=args.dropout,
-                        hidden=args.hidden,
-                        activation=args.activation).to(device)
+    arch = "vit" if args.vit else "cnn"
+    model = build_torch_model(arch, args.backbone, p_drop=args.dropout,
+                              hidden=args.hidden,
+                              activation=args.activation).to(device)
     model.freeze_encoder(True)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
                             lr=1e-3, weight_decay=1e-4)
@@ -439,7 +580,8 @@ def train_model(tr_rows, va_rows, args, device, cache, aligned=None):
             model.freeze_encoder(False)
             opt = torch.optim.AdamW([
                 {"params": model.enc.parameters(), "lr": 1e-4},
-                {"params": model.head.parameters(), "lr": 5e-4},
+                {"params": [p for n, p in model.named_parameters()
+                            if not n.startswith("enc.")], "lr": 5e-4},
             ], weight_decay=1e-4)
 
         model.train_mode()
@@ -449,7 +591,8 @@ def train_model(tr_rows, va_rows, args, device, cache, aligned=None):
             loss.backward()
             opt.step()
 
-        p, y = probs_and_labels(model, va, device)
+        z, y = logits_and_labels(model, va, device)
+        p = sigmoid(z)
         auc = roc_auc_score(y, p) if len(set(y)) > 1 else float("nan")
         score, thr = val_metric(args.metric, y, p)
         history.append({"auc": float(auc),
@@ -470,15 +613,19 @@ def train_model(tr_rows, va_rows, args, device, cache, aligned=None):
 
     epoch_progress_done()
     model.load_state_dict(best["state"])
-    p, y = probs_and_labels(model, va, device)
-    tp, fp, fn, tn = confusion(y, p, best["thr"])
+    z, y = logits_and_labels(model, va, device)
+    calib = make_calibration(z, y, pos_rate, best["thr"])
+    tp, fp, fn, tn = confusion(
+        y, sigmoid(decision_logit(z, calib, mode=args.calibration)), 0.5)
     acc = (tp + tn) / max(len(y), 1)
 
     path = f"{args.prefix}.pt"
-    torch.save({"model": best["state"], "backbone": args.backbone, "size": size,
-                "threshold": best["thr"], "val_auc": best["auc"],
+    torch.save({"model": best["state"], "arch": arch,
+                "backbone": args.backbone, "size": size,
+                "val_auc": best["auc"],
                 "dropout": args.dropout, "hidden": args.hidden,
-                "activation": args.activation}, path)
+                "activation": args.activation,
+                **calib, **split_meta(args)}, path)
     return {"auc": best["auc"], "acc": acc, "epoch": best["epoch"],
             "tp": tp, "fp": fp, "fn": fn, "tn": tn, "path": path,
             "n_val": len(y), "history": history}
@@ -591,16 +738,16 @@ def keras_impl():
             loss=keras.losses.BinaryCrossentropy(from_logits=True),
         )
 
-    def k_probs_and_labels(model, seq):
-        ps, ys = [], []
+    def k_logits_and_labels(model, seq):
+        zs, ys = [], []
         for i in range(len(seq)):
             (a, b), y = seq[i]
-            logits = model.predict_on_batch((a, b)).squeeze(-1)
-            ps.append(1.0 / (1.0 + np.exp(-logits)))
+            zs.append(model.predict_on_batch((a, b)).squeeze(-1))
             ys.append(y)
-        return np.concatenate(ps), np.concatenate(ys)
+        return np.concatenate(zs), np.concatenate(ys)
 
-    def k_train_model(tr_rows, va_rows, args, cache, aligned=None):
+    def k_train_model(tr_rows, va_rows, args, cache, aligned=None,
+                      pos_rate=0.5):
         keras.utils.set_random_seed(args.seed)
         size = (args.height, args.width)
         flip = args.flip
@@ -627,7 +774,8 @@ def keras_impl():
 
             model.fit(tr, epochs=1, verbose=0)
 
-            p, y = k_probs_and_labels(model, va)
+            z, y = k_logits_and_labels(model, va)
+            p = sigmoid(z)
             auc = roc_auc_score(y, p) if len(set(y)) > 1 else float("nan")
             score, thr = val_metric(args.metric, y, p)
             history.append({"auc": float(auc),
@@ -646,17 +794,20 @@ def keras_impl():
 
         epoch_progress_done()
         model.set_weights(best["weights"])
-        p, y = k_probs_and_labels(model, va)
-        tp, fp, fn, tn = confusion(y, p, best["thr"])
+        z, y = k_logits_and_labels(model, va)
+        calib = make_calibration(z, y, pos_rate, best["thr"])
+        tp, fp, fn, tn = confusion(
+            y, sigmoid(decision_logit(z, calib, mode=args.calibration)), 0.5)
         acc = (tp + tn) / max(len(y), 1)
 
         path = f"{args.prefix}.keras"
         model.save(path)
         Path(f"{args.prefix}.json").write_text(json.dumps({
-            "size": [args.height, args.width], "threshold": best["thr"],
+            "size": [args.height, args.width],
             "val_auc": best["auc"], "backbone": "efficientnetb0",
             "dropout": args.dropout, "hidden": args.hidden,
             "activation": args.activation,
+            **calib, **split_meta(args),
         }))
         return {"auc": best["auc"], "acc": acc, "epoch": best["epoch"],
                 "tp": tp, "fp": fp, "fn": fn, "tn": tn, "path": path,
@@ -670,11 +821,11 @@ def keras_impl():
         for cp in paths:
             meta = json.loads(Path(cp).with_suffix(".json").read_text())
             models.append((keras.models.load_model(cp),
-                           tuple(meta["size"]), meta["threshold"]))
+                           tuple(meta["size"]), meta))
         return models
 
-    def k_pair_prob(model, before, after, size, cache=None, aligned=None,
-                    flip=False):
+    def k_pair_logit(model, before, after, size, cache=None, aligned=None,
+                     flip=False):
         seq = PairSequence([{"before": before, "after": after, "y": 0.0}],
                            size, train=False, cache=cache, batch_size=1,
                            shuffle=False, aligned=aligned)
@@ -684,7 +835,7 @@ def keras_impl():
         if flip:
             logits.append(model.predict_on_batch(
                 (np.flip(a, 2).copy(), np.flip(b, 2).copy())).squeeze())
-        return float(1.0 / (1.0 + np.exp(-np.mean(logits))))
+        return float(np.mean(logits))
 
     def k_grad_cam(model, row, size, cache=None, aligned=None):
         """Grad-CAM under the torch backend: split the model at the
@@ -722,7 +873,7 @@ def keras_impl():
     from types import SimpleNamespace
     _KERAS_IMPL = SimpleNamespace(
         train_model=k_train_model, load_ensemble=k_load_ensemble,
-        pair_prob=k_pair_prob, grad_cam=k_grad_cam,
+        pair_logit=k_pair_logit, grad_cam=k_grad_cam,
     )
     return _KERAS_IMPL
 
@@ -731,20 +882,39 @@ def keras_impl():
 # commands (dispatch on --keras / --torch)
 # --------------------------------------------------------------------------- #
 def resolve_defaults(args):
+    if args.vit:
+        args.keras = False              # the ViT model is torch-only
+    name = "kmodel" if args.keras else "vmodel" if args.vit else "model"
     if getattr(args, "prefix", None) is None:
-        args.prefix = "kmodel" if args.keras else "model"
+        args.prefix = name
     if getattr(args, "ckpt", None) is None:
-        args.ckpt = "kmodel*.keras" if args.keras else "model*.pt"
+        args.ckpt = f"{name}*.keras" if args.keras else f"{name}*.pt"
+    if getattr(args, "calibration", None) is None:
+        # measured over 5 seeds: Platt helps the ViT (validation tracks test)
+        # and hurts the CNNs (validation near chance on some seeds)
+        args.calibration = "platt" if args.vit else "threshold"
+    if args.cmd != "train":
+        return
+    if args.backbone is None:
+        args.backbone = ("vit_small_patch14_dinov2.lvd142m" if args.vit
+                         else "resnet18")
+    # DINOv2 patches are 14px: 224 = a 16x16 grid with no padding
+    side = 224 if args.vit else 256
+    args.height = args.height or side
+    args.width = args.width or side
+    if args.freeze_epochs is None:
+        # the ViT design assumes a frozen encoder: never unfreeze by default
+        args.freeze_epochs = args.epochs if args.vit else 10
 
 
-def cmd_train(args):
-    resolve_defaults(args)
-    impl = keras_impl() if args.keras else None
-    device = None
-    if not args.keras:
-        device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"device: {device}\n")
+def split_meta(args):
+    """What calibrate needs to rebuild this run's validation split."""
+    return {k: getattr(args, k) for k in (
+        "seed", "val_fraction", "root", "challenge_root", "reverse",
+        "identity_negatives")}
 
+
+def load_training_rows(args):
     rows = load_pairs(args.root, reverse_positives=args.reverse,
                       identity_negatives=args.identity_negatives)
 
@@ -774,18 +944,38 @@ def cmd_train(args):
                   f"if it is the same physical location under another name, "
                   f"the split may leak it")
 
-    cache = ImageCache(args.cache_side).warm(rows) if args.cache else None
-    aligned = align_rows(rows, cache) if args.align else None
-    print()
+    return rows
 
+
+def split_rows(rows, args):
     tr_rows, va_rows = scene_split(rows, args.seed, args.val_fraction)
     # identity negatives are train-only: without augmentation they are
     # pixel-identical and would flatter validation
     va_rows = [r for r in va_rows if not r.get("identity", False)]
+    return tr_rows, va_rows
+
+
+def cmd_train(args):
+    resolve_defaults(args)
+    impl = keras_impl() if args.keras else None
+    device = None
+    if not args.keras:
+        device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"device: {device}\n")
+
+    rows = load_training_rows(args)
+    cache = ImageCache(args.cache_side).warm(rows) if args.cache else None
+    aligned = align_rows(rows, cache) if args.align else None
+    print()
+
+    tr_rows, va_rows = split_rows(rows, args)
+    # reference base rate for decisions: natural pairs of the training data
+    pos_rate = float(np.mean([r["y"] for r in rows
+                              if not r.get("identity") and not r.get("reversed")]))
     if args.keras:
-        r = impl.train_model(tr_rows, va_rows, args, cache, aligned)
+        r = impl.train_model(tr_rows, va_rows, args, cache, aligned, pos_rate)
     else:
-        r = train_model(tr_rows, va_rows, args, device, cache, aligned)
+        r = train_model(tr_rows, va_rows, args, device, cache, aligned, pos_rate)
     print(f"{r['n_val']:3d} val pairs | AUC {r['auc']:.3f} | "
           f"acc {r['acc']:.3f} | TP {r['tp']} FP {r['fp']} FN {r['fn']} "
           f"TN {r['tn']} | best epoch {r['epoch']}")
@@ -808,19 +998,21 @@ def load_ensemble(ckpt_glob, device):
     models = []
     for cp in paths:
         ck = torch.load(cp, map_location=device, weights_only=False)
-        m = SiameseBool(ck["backbone"], pretrained=False,
-                        p_drop=ck.get("dropout", 0.4),
-                        hidden=ck.get("hidden", 128),
-                        activation=ck.get("activation", "gelu")).to(device)
+        m = build_torch_model(ck.get("arch", "cnn"), ck["backbone"],
+                              pretrained=False,
+                              p_drop=ck.get("dropout", 0.4),
+                              hidden=ck.get("hidden", 128),
+                              activation=ck.get("activation", "gelu")).to(device)
         m.load_state_dict(ck["model"])
         m.eval()
-        models.append((m, ck["size"], ck["threshold"]))
+        models.append((m, ck["size"],
+                       {k: v for k, v in ck.items() if k != "model"}))
     return models
 
 
 @torch.no_grad()
-def pair_prob(model, before, after, size, device, cache=None, aligned=None,
-              flip=False):
+def pair_logit(model, before, after, size, device, cache=None, aligned=None,
+               flip=False):
     ds = PairSet([{"before": before, "after": after, "y": 0.0}],
                  size, train=False, cache=cache, aligned=aligned)
     a, b, _ = ds[0]
@@ -829,20 +1021,36 @@ def pair_prob(model, before, after, size, device, cache=None, aligned=None,
     logits = [model(a, b)]
     if flip:
         logits.append(model(torch.flip(a, [-1]), torch.flip(b, [-1])))
-    return float(torch.sigmoid(torch.stack(logits).mean()).item())
+    return float(torch.stack(logits).mean().item())
 
 
 def make_pair_scorer(args, cache=None, aligned=None):
-    """Return (models, score(model, size, before, after)) for either backend."""
+    """Return (models, logit(model, size, before, after)) for either backend."""
     if args.keras:
         impl = keras_impl()
         models = impl.load_ensemble(args.ckpt)
-        return models, lambda m, size, bf, af: impl.pair_prob(
+        return models, lambda m, size, bf, af: impl.pair_logit(
             m, bf, af, size, cache, aligned, args.flip)
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     models = load_ensemble(args.ckpt, device)
-    return models, lambda m, size, bf, af: pair_prob(
+    return models, lambda m, size, bf, af: pair_logit(
         m, bf, af, size, device, cache, aligned, args.flip)
+
+
+def ensemble_threshold(models):
+    """The members' stored thresholds averaged in logit space: the raw
+    probability that --calibration threshold effectively cuts at."""
+    return float(sigmoid(np.mean(logit([c["threshold"] for _, _, c in models]))))
+
+
+def ensemble_prob(models, score, before, after, prior=None, mode="platt"):
+    """(ensemble probability, per-member probabilities). Members vote with
+    calibrated logits (decision_logit), averaged -- one scale for all, and a
+    confident member is not squashed by sigmoid saturation before
+    averaging. The decision is prob > 0.5."""
+    d = [decision_logit(score(m, size, before, after), calib, prior, mode)
+         for m, size, calib in models]
+    return float(sigmoid(np.mean(d))), [float(x) for x in sigmoid(d)]
 
 
 def cmd_predict(args):
@@ -851,15 +1059,14 @@ def cmd_predict(args):
                          "(as flags or config keys)")
     resolve_defaults(args)
     models, score = make_pair_scorer(args)
-    probs = [score(m, size, args.before, args.after) for m, size, _ in models]
-    thr = float(np.mean([t for _, _, t in models]))
-    p = float(np.mean(probs))
+    p, per_model = ensemble_prob(models, score, args.before, args.after,
+                                 args.prior, args.calibration)
     print(json.dumps({
-        "any_missing": bool(p > thr),
+        "any_missing": bool(p > 0.5),
         "prob": round(p, 3),
-        "threshold": round(thr, 3),
+        "threshold": 0.5,
         "models": len(models),
-        "per_model": [round(x, 3) for x in probs],
+        "per_model": [round(x, 3) for x in per_model],
     }, indent=2))
 
 
@@ -875,16 +1082,22 @@ def cmd_evaluate(args):
     print()
 
     y = np.array([r["y"] for r in rows])
-    p = np.array([
-        float(np.mean([score(m, size, r["before"], r["after"])
-                       for m, size, _ in models]))
-        for r in rows
-    ])
-    thr = float(np.mean([t for _, _, t in models]))
+    p = np.array([ensemble_prob(models, score, r["before"], r["after"],
+                                args.prior, args.calibration)[0] for r in rows])
+    thr = 0.5
     tp, fp, fn, tn = confusion(y, p, thr)
     auc = roc_auc_score(y, p) if len(set(y)) > 1 else float("nan")
 
-    print(f"{len(rows)} pairs | threshold {thr:.3f}")
+    if args.calibration == "platt":
+        uncal = sum("platt" not in c for _, _, c in models)
+        how = ("Platt-calibrated probability"
+               + (f", prior {args.prior}" if args.prior is not None else "")
+               + (f"; {uncal} uncalibrated model(s) cut at their stored "
+                  f"threshold -- run calibrate" if uncal else ""))
+    else:
+        how = ("stored validation threshold, "
+               f"{ensemble_threshold(models):.3f} as a raw probability")
+    print(f"{len(rows)} pairs | decision prob > {thr:.3f} ({how})")
     print(f"AUC {auc:.3f}   acc {(tp + tn) / len(rows):.3f}")
     print(f"TP {tp}  FP {fp}  FN {fn}  TN {tn}")
     if tp + fp:
@@ -929,6 +1142,55 @@ def cmd_evaluate(args):
         print(f"saved {len(list(chosen))} grad-cam panels to {folder}/")
 
 
+def cmd_calibrate(args):
+    """Fit Platt parameters for existing checkpoints and write them back in
+    place (.pt / the .keras json sidecar), without retraining. Each
+    checkpoint's own validation split is rebuilt from its stored split
+    settings; checkpoints that predate them use the flags given here."""
+    resolve_defaults(args)
+    paths = sorted(glob.glob(args.ckpt))
+    if not paths:
+        raise SystemExit(f"no checkpoints matched {args.ckpt!r}")
+    impl = keras_impl() if args.keras else None
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    for path in paths:
+        if args.keras:
+            meta_path = Path(path).with_suffix(".json")
+            meta = json.loads(meta_path.read_text())
+        else:
+            meta = torch.load(path, map_location="cpu", weights_only=False)
+        run = argparse.Namespace(**vars(args))
+        for k, v in meta.items():
+            if k in split_meta(args):
+                setattr(run, k, v)
+        rows = load_training_rows(run)
+        _, va_rows = split_rows(rows, run)
+        pos_rate = float(np.mean([r["y"] for r in rows
+                                  if not r.get("identity")
+                                  and not r.get("reversed")]))
+        cache = ImageCache(args.cache_side).warm(va_rows) if args.cache else None
+        aligned = align_rows(va_rows, cache) if args.align else None
+        run.ckpt = path
+        models, score = make_pair_scorer(run, cache, aligned)
+        m, size, _ = models[0]
+        z = np.array([score(m, size, r["before"], r["after"]) for r in va_rows])
+        y = np.array([r["y"] for r in va_rows])
+        calib = make_calibration(z, y, pos_rate,
+                                 meta.get("threshold", best_threshold(y, sigmoid(z))))
+        meta.update(calib)
+        meta.update({k: getattr(run, k) for k in split_meta(run)})
+        if args.keras:
+            meta_path.write_text(json.dumps(meta))
+        else:
+            torch.save(meta, path)
+        a, b = calib["platt"]
+        cut = sigmoid(-(b - logit(calib["val_pos_rate"])
+                        + logit(calib["pos_rate"])) / a)
+        print(f"{path}: seed {run.seed} | {len(y)} val pairs "
+              f"({int(y.sum())} missing) | a={a:.3f} b={b:.3f} | "
+              f"raw-prob cut {cut:.3f} (was {calib['threshold']:.3f})")
+
+
 # --------------------------------------------------------------------------- #
 def load_config(path):
     """Read a JSON config whose keys mirror the CLI flags.
@@ -952,6 +1214,10 @@ def main():
                             "sets KERAS_BACKEND=torch unless already set")
     group.add_argument("--torch", dest="keras", action="store_false",
                        help="PyTorch implementation (ResNet18)")
+    group.add_argument("--vit", action="store_true",
+                       help="PyTorch ViT implementation (frozen DINOv2 patch "
+                            "tokens + cross-attention, Vit_siamese.py); "
+                            "saves vmodel.pt")
     backend.set_defaults(keras=True)
     backend.add_argument("--device", default=None,
                          help="cuda | cpu | mps (torch implementation only)")
@@ -963,26 +1229,47 @@ def main():
                               "test-time averaging (off by default; use the "
                               "same setting for train and inference)")
 
+    split = argparse.ArgumentParser(add_help=False)
+    split.add_argument("--root", default="data")
+    split.add_argument("--challenge-root", "--challenge_root", default=None,
+                       help="extra folder of harder training pairs (e.g. "
+                            "../somethings_missing_here/challenging/training); "
+                            "scenes matching a training scene by name stay on "
+                            "its side of the split")
+    split.add_argument("--val-fraction", type=float, default=0.2,
+                       help="fraction of rows held out (whole scenes) for "
+                            "validation (default: 0.2)")
+    split.add_argument("--seed", type=int, default=42)
+    split.add_argument("--reverse", action="store_true",
+                       help="add a swapped-order negative per positive (a "
+                            "removal read backwards is an addition); off by "
+                            "default")
+    split.add_argument("--identity-negatives", action="store_true",
+                       help="add same-photo no-change negatives (for datasets "
+                            "with no natural negative pairs)")
+
+    prior_help = ("expected fraction of pairs with something missing where "
+                  "the model is used; moves the decision point (default: the "
+                  "training data's rate; platt only)")
+    calib_help = ("how a model's logit becomes a decision: platt = Platt "
+                  "scaling fitted on validation, cut at 0.5; threshold = the "
+                  "stored validation threshold (Youden's J). Default: platt "
+                  "with --vit, threshold otherwise")
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=None,
                     help="JSON file with flag values; may include \"cmd\"")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    t = sub.add_parser("train", parents=[backend])
-    t.add_argument("--root", default="data")
-    t.add_argument("--challenge-root", "--challenge_root", default=None,
-                   help="extra folder of harder training pairs (e.g. "
-                        "../somethings_missing_here/challenging/training); "
-                        "scenes matching a training scene by name stay on "
-                        "its side of the split")
-    t.add_argument("--backbone", default="resnet18",
-                   help="timm model name (torch only; keras always uses "
-                        "EfficientNetB0)")
-    t.add_argument("--val-fraction", type=float, default=0.2,
-                   help="fraction of rows held out (whole scenes) for "
-                        "validation (default: 0.2)")
+    t = sub.add_parser("train", parents=[backend, split])
+    t.add_argument("--backbone", default=None,
+                   help="timm model name (default: resnet18, or "
+                        "vit_small_patch14_dinov2.lvd142m with --vit; "
+                        "keras always uses EfficientNetB0)")
     t.add_argument("--epochs", type=int, default=60)
-    t.add_argument("--freeze-epochs", type=int, default=10)
+    t.add_argument("--freeze-epochs", type=int, default=None,
+                   help="epochs before unfreezing the encoder (default: 10; "
+                        "with --vit never)")
     t.add_argument("--patience", type=int, default=15)
     t.add_argument("--metric", choices=["auc", "acc"], default="auc",
                    help="validation metric for epoch selection and early "
@@ -995,11 +1282,14 @@ def main():
     t.add_argument("--activation", default="relu",
                    choices=sorted(ACTIVATIONS),
                    help="head activation (default: relu)")
-    t.add_argument("--height", type=int, default=256)
-    t.add_argument("--width", type=int, default=256)
-    t.add_argument("--seed", type=int, default=42)
+    t.add_argument("--height", type=int, default=None,
+                   help="default: 256, or 224 with --vit (use multiples "
+                        "of 14 for DINOv2)")
+    t.add_argument("--width", type=int, default=None,
+                   help="default: 256, or 224 with --vit")
     t.add_argument("--prefix", default=None,
-                   help="checkpoint name prefix (default: model / kmodel)")
+                   help="checkpoint name prefix (default: model / kmodel "
+                        "/ vmodel)")
     t.add_argument("--workers", type=int, default=2)
     t.add_argument("--cache", action="store_true", help="decode images once into RAM")
     t.add_argument("--align", action="store_true",
@@ -1010,27 +1300,26 @@ def main():
                    metavar="FILE",
                    help="plot per-epoch validation AUC and accuracy to FILE "
                         "(default: <prefix>curves.png); needs matplotlib")
-    t.add_argument("--reverse", action="store_true",
-                   help="add a swapped-order negative per positive (a removal "
-                        "read backwards is an addition); off by default")
-    t.add_argument("--identity-negatives", action="store_true",
-                   help="add same-photo no-change negatives (for datasets "
-                        "with no natural negative pairs)")
     t.set_defaults(func=cmd_train)
 
     p = sub.add_parser("predict", parents=[backend])
     p.add_argument("--ckpt", default=None,
-                   help="checkpoint glob (default: model*.pt / kmodel*.keras); "
+                   help="checkpoint glob (default: model*.pt / kmodel*.keras / "
+                        "vmodel*.pt); "
                         "several matches are averaged as an ensemble")
     p.add_argument("--before", default=None, help="required (flag or config)")
     p.add_argument("--after", default=None, help="required (flag or config)")
+    p.add_argument("--prior", type=float, default=None, help=prior_help)
+    p.add_argument("--calibration", choices=["platt", "threshold"],
+                   default=None, help=calib_help)
     p.set_defaults(func=cmd_predict)
 
     e = sub.add_parser("evaluate", parents=[backend])
     e.add_argument("--root", default=None,
                    help="held-out folder, same layout; required (flag or config)")
     e.add_argument("--ckpt", default=None,
-                   help="checkpoint glob (default: model*.pt / kmodel*.keras); "
+                   help="checkpoint glob (default: model*.pt / kmodel*.keras / "
+                        "vmodel*.pt); "
                         "several matches are averaged as an ensemble")
     e.add_argument("--cache", action="store_true")
     e.add_argument("--align", action="store_true",
@@ -1042,7 +1331,22 @@ def main():
     e.add_argument("--viz-all", action="store_true",
                    help="visualize every pair, not just failures "
                         "(default folder: viz)")
+    e.add_argument("--prior", type=float, default=None, help=prior_help)
+    e.add_argument("--calibration", choices=["platt", "threshold"],
+                   default=None, help=calib_help)
     e.set_defaults(func=cmd_evaluate)
+
+    c = sub.add_parser("calibrate", parents=[backend, split],
+                       help="fit Platt parameters for existing checkpoints "
+                            "on their own validation split (no retraining)")
+    c.add_argument("--ckpt", default=None,
+                   help="checkpoint glob (default: model*.pt / kmodel*.keras "
+                        "/ vmodel*.pt); each is calibrated separately")
+    c.add_argument("--cache", action="store_true")
+    c.add_argument("--align", action="store_true",
+                   help="use when the model was trained with --align")
+    c.add_argument("--cache-side", type=int, default=640)
+    c.set_defaults(func=cmd_calibrate)
 
     # --config: pre-scan argv, then install config values as parser defaults
     # for the target subcommand -- explicit CLI flags override naturally.
@@ -1052,7 +1356,8 @@ def main():
     known, _ = pre.parse_known_args(argv)
     if known.config:
         cfg = load_config(known.config)
-        subcommands = {"train": t, "predict": p, "evaluate": e}
+        subcommands = {"train": t, "predict": p, "evaluate": e,
+                       "calibrate": c}
         cmd = next((a for a in argv if a in subcommands), None)
         if cmd is None:
             cmd = cfg.get("cmd")
