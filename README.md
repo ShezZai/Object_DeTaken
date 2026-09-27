@@ -153,6 +153,7 @@ pair correctly passed.
 | Validation AUC, range | 0.528–0.796 | 0.924–1.000 |
 | Seeds won on test AUC | 0 / 5 | **5 / 5** |
 | Train time per seed | 81–278 s | 75–92 s |
+| Model latency, GPU | 60.9 ms | **6.9 ms** |
 
 Confusion matrices summed over the 5 single-seed models (5 × 116 = 580
 decisions each):
@@ -185,6 +186,55 @@ more removals *and* raises a third of the false alarms.
 The ViT ensemble reaches the classical pipeline's accuracy (0.88 there,
 0.905 here) with 1 false alarm instead of 12, at a lower recall (0.897
 vs. 0.98).
+
+### Cost: training time, parameters, latency
+
+Measured on one machine: NVIDIA RTX 5060 Ti 16 GB, Intel i7-14700F, each
+backend at its default input size (Keras 256 px, ViT 224 px).
+
+**Parameters**
+
+| | Keras (EfficientNetB0) | ViT (DINOv2 ViT-S/14) |
+|---|---|---|
+| Encoder | 4,049,571 | 22,056,192 |
+| Head | 492,033 | 314,625 |
+| **Total** | **4,541,604** | **22,370,817** |
+| Trained | 492,033 for 10 epochs, then all 4,541,604 | 314,625 — the encoder is never unfrozen |
+
+The ViT is ~5× larger in total but trains ~36% fewer parameters, and none
+of them in the encoder — which is why it cannot suffer the post-unfreeze
+collapses the CNNs are prone to.
+
+**Training time** (`--cache`, wall clock incl. startup and image caching;
+epochs = best epoch + 15 patience, capped at 60)
+
+| Seed | Keras | ViT |
+|---|---|---|
+| 42 | 107 s (22 epochs) | 77 s (29 epochs) |
+| 7 | 121 s (25 epochs) | 86 s (34 epochs) |
+| 1 | 81 s (16 epochs) | 92 s (38 epochs) |
+| 2 | 239 s (52 epochs) | 75 s (27 epochs) |
+| 3 | 278 s (60 epochs) | 92 s (37 epochs) |
+| **5 seeds** | **826 s (13.8 min), ~4.7 s/epoch** | **422 s (7.0 min), ~2.6 s/epoch** |
+
+The ViT's epochs are ~45% faster (its encoder never needs a backward
+pass, and it runs at 224 px against Keras' 256 px), and its run length is steadier: 27–38 epochs against
+Keras' 16–60.
+
+**Inference latency per pair** (batch 1, median of 50 after warm-up, one
+model — an ensemble costs this × its size)
+
+| | Keras GPU | ViT GPU | Keras CPU | ViT CPU |
+|---|---|---|---|---|
+| Model only (both photos through the network) | 60.9 ms | **6.9 ms** | 163.5 ms | **43.5 ms** |
+| End to end (`predict`: 2 JPEG decodes + resize + model) | 129.8 ms | **74.4 ms** | 223.2 ms | **112.6 ms** |
+
+The model itself is ~9× faster on GPU and ~4× on CPU. Keras' time is
+real compute, not API overhead (a direct model call measures the same
+59 ms): the Keras 3 torch backend runs EfficientNetB0's depthwise
+convolutions op by op at batch 1, while the ViT is a few large matrix
+multiplies. End to end, decoding the two full-size photos dominates the
+ViT's time.
 
 ### `challenging/test` (12 pairs: 6 removals, 6 swaps/rearrangements)
 
