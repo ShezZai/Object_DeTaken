@@ -1,6 +1,6 @@
 # Object DeTaken
 
-A project by **Shay Gil** and **Michal Peri Markov**.
+A project by **Shay Gil** and **Michal Peri Markovich**.
 
 Given two photos of the same scene — a "before" and an "after" — decide
 whether something went missing, and point at what was taken.
@@ -61,11 +61,14 @@ for validation (a scene never appears in both train and validation), uses
 heavy shared-geometry/independent-photometry augmentation, and picks the
 decision threshold on validation (Youden's J); at inference every
 checkpoint matching a glob is averaged, so multi-seed ensembles come free.
-Two interchangeable implementations behind one CLI: Keras 3 +
-EfficientNetB0 (`--keras`, the default) and PyTorch + ResNet18 (`--torch`).
+Three interchangeable implementations behind one CLI: Keras 3 +
+EfficientNetB0 (`--keras`, the default), PyTorch + ResNet18 (`--torch`),
+and a PyTorch ViT that compares patch tokens (`--vit`, see below).
 
-**The best results came from the Keras/EfficientNetB0 implementation** —
-which is why it is the default.
+**Before the ViT addition, Keras/EfficientNetB0 was the winner** of the
+two CNN encoders (EfficientNetB0 vs. ResNet18), which is why it is the
+default. The ViT concept now beats it — see
+[ViT addition and its checks against Keras](#vit-addition-and-its-checks-against-keras-efficientnetb0).
 Other lessons the experiments taught us, mostly the hard way:
 
 - **Seed variance dominates.** The identical configuration scored test
@@ -83,6 +86,181 @@ Other lessons the experiments taught us, mostly the hard way:
 
 Training, prediction, evaluation, and Grad-CAM visualization are
 documented in [`siamese_missing/README.md`](siamese_missing/README.md).
+
+## ViT addition and its checks against Keras (EfficientNetB0)
+
+Both CNN models pool each photo into one vector before comparing. A
+missing cup covers ~1% of the image, so after pooling it is ~1% of the
+feature vector. The ViT model (`siamese_missing/Vit_siamese.py`,
+`--vit`) compares *patches* instead:
+
+1. a frozen DINOv2 ViT-S/14 keeps its patch tokens (no pooling);
+2. every *before* patch looks for itself among the *after* patches with
+   cross-attention — a moved object is found elsewhere, a taken one is
+   not (the learned version of the pipeline's template-matching step);
+3. a small transformer scores each before-patch as "gone", and the pair
+   logit is a smooth max over those scores — one unexplained patch is
+   enough. The per-patch scores are trained by the classification loss
+   and double as a localization map (`evaluate --viz`).
+
+Only ~315k parameters train; the encoder stays frozen.
+
+**Result: the ViT concept is better, and far more robust across seeds.**
+Before this addition Keras/EfficientNetB0 was the winner (EfficientNetB0
+vs. ResNet18 encoders); against the ViT it loses on every seed.
+
+### Setup of the check
+
+The same command for both, only the backend flag swapped
+(`train --keras` / `train --vit`, each with its own defaults: 256 px for
+Keras, 224 px for the ViT), on the dataset's `training` split, 5 seeds
+(42, 7, 1, 2, 3). Each seed holds out different scenes for validation.
+Every model is then scored on the 116 held-out `test` pairs (97 with a
+removal, 19 without) and the 12 `challenging/test` pairs; the ensemble
+averages all 5 seeds.
+
+Decision rule: the ViT uses **Platt scaling** (a logistic fit of the
+model's logit on validation, with Platt's smoothed targets, cut at 0.5);
+Keras uses the **stored validation threshold** (Youden's J, middle of the
+best plateau). These are the per-backend defaults of `--calibration` —
+each backend got the rule that measured better for it (see
+[Choosing the decision rule](#choosing-the-decision-rule)).
+
+### `test` — per seed (116 pairs)
+
+TP = removal caught, FP = false alarm, FN = removal missed, TN = no-change
+pair correctly passed.
+
+| Seed | Model | Val AUC | Test AUC | Acc | TP | FP | FN | TN | Precision | Recall |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 42 | Keras | 0.685 | 0.759 | 0.698 | 69 | 7 | 28 | 12 | 0.908 | 0.711 |
+| 42 | **ViT** | 0.983 | **0.950** | **0.888** | 88 | 4 | 9 | 15 | 0.957 | 0.907 |
+| 7 | Keras | 0.644 | 0.789 | 0.750 | 72 | 4 | 25 | 15 | 0.947 | 0.742 |
+| 7 | **ViT** | 0.964 | **0.938** | **0.888** | 86 | 2 | 11 | 17 | 0.977 | 0.887 |
+| 1 | Keras | 0.528 | 0.849 | 0.784 | 79 | 7 | 18 | 12 | 0.919 | 0.814 |
+| 1 | **ViT** | 0.924 | **0.923** | **0.879** | 85 | 2 | 12 | 17 | 0.977 | 0.876 |
+| 2 | Keras | 0.796 | 0.823 | **0.784** | 77 | 5 | 20 | 14 | 0.939 | 0.794 |
+| 2 | **ViT** | 1.000 | **0.900** | 0.759 | 69 | 0 | 28 | 19 | 1.000 | 0.711 |
+| 3 | Keras | 0.704 | 0.679 | 0.690 | 73 | 12 | 24 | 7 | 0.859 | 0.753 |
+| 3 | **ViT** | 0.927 | **0.918** | **0.853** | 84 | 4 | 13 | 15 | 0.955 | 0.866 |
+
+### `test` — across seeds, and the 5-seed ensembles
+
+| | Keras | ViT |
+|---|---|---|
+| Test AUC, mean (range) | 0.780 (0.679–0.849) | **0.926 (0.900–0.950)** |
+| Accuracy, mean (range) | 0.741 (0.690–0.784) | **0.853 (0.759–0.888)** |
+| Validation AUC, range | 0.528–0.796 | 0.924–1.000 |
+| Seeds won on test AUC | 0 / 5 | **5 / 5** |
+| Train time per seed | 81–278 s | 75–92 s |
+
+Confusion matrices summed over the 5 single-seed models (5 × 116 = 580
+decisions each):
+
+| Keras, 5 seeds | Predicted missing | Predicted no change |
+|---|---|---|
+| **Actually missing** (485) | TP 370 | FN 115 |
+| **Actually no change** (95) | FP 35 | TN 60 |
+
+| ViT, 5 seeds | Predicted missing | Predicted no change |
+|---|---|---|
+| **Actually missing** (485) | TP **412** | FN **73** |
+| **Actually no change** (95) | FP **12** | TN **83** |
+
+Recall 76.3% → 84.9%, false-alarm rate 36.8% → 12.6%: the ViT catches
+more removals *and* raises a third of the false alarms.
+
+5-seed ensembles:
+
+| Keras ensemble (AUC 0.817, acc 0.767) | Predicted missing | Predicted no change |
+|---|---|---|
+| **Actually missing** (97) | TP 76 | FN 21 |
+| **Actually no change** (19) | FP 6 | TN 13 |
+
+| ViT ensemble (AUC 0.958, acc 0.905) | Predicted missing | Predicted no change |
+|---|---|---|
+| **Actually missing** (97) | TP **87** | FN **10** |
+| **Actually no change** (19) | FP **1** | TN **18** |
+
+The ViT ensemble reaches the classical pipeline's accuracy (0.88 there,
+0.905 here) with 1 false alarm instead of 12, at a lower recall (0.897
+vs. 0.98).
+
+### `challenging/test` (12 pairs: 6 removals, 6 swaps/rearrangements)
+
+| Seed | Model | AUC | Acc | TP | FP | FN | TN |
+|---|---|---|---|---|---|---|---|
+| 42 | Keras | 0.389 | 0.500 | 2 | 2 | 4 | 4 |
+| 42 | ViT | 0.444 | 0.500 | 6 | 6 | 0 | 0 |
+| 7 | Keras | 0.250 | 0.500 | 1 | 1 | 5 | 5 |
+| 7 | ViT | 0.389 | 0.500 | 6 | 6 | 0 | 0 |
+| 1 | Keras | 0.250 | 0.250 | 2 | 5 | 4 | 1 |
+| 1 | ViT | 0.444 | 0.333 | 4 | 6 | 2 | 0 |
+| 2 | Keras | 0.528 | 0.583 | 2 | 1 | 4 | 5 |
+| 2 | ViT | 0.611 | 0.500 | 4 | 4 | 2 | 2 |
+| 3 | Keras | 0.472 | 0.500 | 2 | 2 | 4 | 4 |
+| 3 | ViT | 0.167 | 0.500 | 6 | 6 | 0 | 0 |
+| ensemble | Keras | 0.361 | 0.500 | 2 | 2 | 4 | 4 |
+| ensemble | ViT | 0.500 | 0.417 | 5 | 6 | 1 | 0 |
+
+**Neither model solves this split.** Both sit at or below chance; they
+just fail differently — Keras mostly answers "no change", the ViT
+flags nearly every swap as a removal (28 false alarms on 30 no-change
+decisions). The ViT's "is every before-patch found in after?" question
+has no answer for "it is found, but it is a different object"; training
+with `--challenge-root` is the next thing to try. With 12 pairs, one pair
+moves accuracy by 8 points, so read this table as a direction only.
+
+### Choosing the decision rule
+
+With the per-model threshold picked at the edge of the best validation
+cutoff range, the ViT's threshold jumped between seeds (0.886 on one run,
+0.010 on another) because it separates validation almost perfectly and
+every cutoff in the gap looks equally good. Two replacements were tried
+on the same 10 checkpoints (`test` accuracy):
+
+| Seed | Keras, threshold | Keras, Platt | ViT, threshold | ViT, Platt |
+|---|---|---|---|---|
+| 42 | 0.698 | 0.733 | 0.871 | **0.888** |
+| 7 | **0.750** | 0.595 | 0.879 | **0.888** |
+| 1 | **0.784** | 0.164 | 0.871 | **0.879** |
+| 2 | **0.784** | 0.776 | 0.741 | **0.759** |
+| 3 | **0.690** | 0.664 | **0.879** | 0.853 |
+| ensemble | **0.767** | 0.716 | **0.905** | **0.905** |
+| false alarms, 5 seeds | 35 | 26 | 18 | **12** |
+
+Platt helps the ViT (4 of 5 seeds, a third fewer false alarms) because
+its validation scores track its test scores. It hurts Keras: Keras'
+validation AUC is near chance on some seeds (0.53 on seed 1), Platt then
+honestly fits a near-zero slope, and that model answers "no change" to
+everything — even though it ranks the test pairs well (AUC 0.85).
+
+### Caveats
+
+- **The decision rule per backend was chosen on these test results**, so
+  the accuracy figures above are slightly optimistic for both. The AUCs
+  do not depend on the rule, and they carry the conclusion.
+- **Runs are not bit-reproducible**: GPU training is nondeterministic, so
+  the same `--seed` gives a different model on a rerun (Keras seed 42
+  scored test AUC 0.864 in an earlier run, 0.759 here). This is one more
+  reason to compare seed distributions, not single runs.
+- **`test` is removal-heavy** (84% of pairs) while training is 43%; any
+  rule learned on training data under-calls removals there. Pass
+  `--prior` (Platt only) when the deployment rate is known.
+- One ViT seed (2) had a validation split with only 15 removals out of 75
+  and still under-calls removals on test (28 missed) under either rule.
+
+Reproduce:
+
+```bash
+cd siamese_missing
+for seed in 42 7 1 2 3; do
+  python train_missing.py train --keras --root ../somethings_missing_here/training --cache --seed $seed --prefix keras_s$seed
+  python train_missing.py train --vit   --root ../somethings_missing_here/training --cache --seed $seed --prefix vit_s$seed
+done
+python train_missing.py evaluate --keras --root ../somethings_missing_here/test --cache --ckpt 'keras_s*.keras'
+python train_missing.py evaluate --vit   --root ../somethings_missing_here/test --cache --ckpt 'vit_s*.pt'
+```
 
 ## Setup
 
