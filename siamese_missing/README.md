@@ -133,9 +133,14 @@ unexplained patch is enough — the point for small objects that global
 pooling dilutes. Defaults change with it: backbone
 `vit_small_patch14_dinov2.lvd142m`, 224×224 (use multiples of 14), and the
 encoder is never unfrozen unless you pass `--freeze-epochs`. With
-`evaluate --viz`, the panels show the model's own trained patch scores
-instead of Grad-CAM (absolute scale: a dark map means no patch was
-confident).
+`evaluate --viz` (or `predict --viz FILE`), the ViT panels mark the
+before-patches behind the call instead of showing Grad-CAM: red boxes,
+ranked by their share of the "missing" logit (gradient × activation at
+the per-patch evidence, before the patches are mixed), keyed with each
+patch's best DINOv2 cosine similarity in *after* — low means nothing like
+it remains, high everywhere (typical of false alarms) means everything
+was found. On *after*, red marks the same place and cyan the best match
+when it lies elsewhere (a moved object).
 
 ```bash
 python train_missing.py train --vit --root data --cache

@@ -100,8 +100,10 @@ feature vector. The ViT model (`siamese_missing/Vit_siamese.py`,
    not (the learned version of the pipeline's template-matching step);
 3. a small transformer scores each before-patch as "gone", and the pair
    logit is a smooth max over those scores — one unexplained patch is
-   enough. The per-patch scores are trained by the classification loss
-   and double as a localization map (`evaluate --viz`).
+   enough. `predict --viz` / `evaluate --viz` box the before-patches
+   behind a "missing" call (gradient × activation — the patch scores
+   themselves come out flat, because the transformer spreads the verdict
+   over every patch) and give each one's best match in *after*.
 
 Only ~315k parameters train; the encoder stays frozen.
 
@@ -261,6 +263,49 @@ has no answer for "it is found, but it is a different object"; training
 with `--challenge-root` is the next thing to try. With 12 pairs, one pair
 moves accuracy by 8 points, so read this table as a direction only.
 
+### What the ViT looks at
+
+`predict --viz` / `evaluate --viz` draw the evidence behind a call. On
+**BEFORE**, red boxes mark the patches carrying the "missing" score,
+numbered by their share of it; the key in the corner adds each patch's
+best cosine similarity in *after* (DINOv2 features) — **low means
+nothing like it remains**. On **AFTER**, red marks the same places and
+cyan the best match when it lies elsewhere (what a moved object looks
+like). Boxes are the network's 14 px patches on its 224 px input, drawn
+at 3×.
+
+**Removed pink case** (5-seed ensemble, p = 0.92): three patches carry
+91% of the call, all on the case, and none of them has a counterpart in
+*after* (similarity 0.38–0.46).
+
+![ViT evidence: removed pink case](docs/images/vit_viz_pink_case.jpg)
+
+**Removed green rattle** (seed 42, p = 0.90): the five lowest-similarity
+patches (0.66–0.79) are the rattle's. The knife and toy next to it also
+draw attention — they are what the model compares — but they are found
+again (0.92–0.97).
+
+![ViT evidence: removed green rattle](docs/images/vit_viz_rattle.jpg)
+
+**Removed stroller** (Remove360, seed 42, p = 0.90): the boxes sit on
+the stroller's base, with the lowest similarities of all (0.34–0.62).
+
+![ViT evidence: removed stroller](docs/images/vit_viz_stroller.jpg)
+
+**A false alarm** (nothing removed, seed 42, p = 0.83): the evidence is
+spread thin (top 8 patches = 55%) and every flagged patch *is* found in
+*after* (0.80–0.93). The panel shows there is nothing missing — the
+model reacted to the camera shift, not to an absent object.
+
+![ViT evidence: false alarm](docs/images/vit_viz_false_alarm.jpg)
+
+The shares come from gradient × activation at each before-patch's
+evidence vector, taken before the reasoning transformer mixes the
+patches. The model's own per-patch scores cannot be used for this: that
+transformer spreads the verdict over every patch, so they come out
+nearly flat (~200 of 256 patches share the score on `test`, vs. ~14
+here).
+
 ### Choosing the decision rule
 
 With the per-model threshold picked at the edge of the best validation
@@ -340,6 +385,7 @@ are downloaded automatically by Ultralytics on first run.
   (see `pipeline/README.md`)
 - `siamese_missing/` — the trainable siamese model
   (see `siamese_missing/README.md`)
+- `docs/images/` — figures used in this README
 - `download_dataset.py` — fetch the dataset from Hugging Face
 - `make_crop_negatives.py` — generate crop-shift no-change pairs
   (training splits only)

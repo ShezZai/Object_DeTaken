@@ -17,9 +17,12 @@ Differences from the CNN version:
      negatives still work unchanged.
   4. A tiny transformer reads the residual tokens and scores every patch.
      The pair logit is a smooth max over those scores (log-mean-exp: "at
-     least one patch is unexplained"), so the per-patch scores are trained
-     by the classification loss itself and double as a localization map
-     (replaces Grad-CAM).
+     least one patch is unexplained"). The per-patch scores do NOT
+     localize, though: the reasoning transformer lets every token see all
+     the others, so the verdict spreads over all of them and the scores
+     come out nearly flat. Localization comes from gradient x activation
+     at the fused per-patch evidence, before that mixing (vit_evidence in
+     train_missing.py).
 
 Use --height/--width multiples of 14 (224, 336, 448) for DINOv2.
 """
@@ -54,7 +57,8 @@ class SiameseViT(nn.Module):
                                            activation="gelu", norm_first=True)
         self.reason = nn.TransformerEncoder(layer, depth,
                                             enable_nested_tensor=False)
-        # per-patch "this before-patch is gone" logit == localization map
+        # per-patch "this before-patch is gone" logit (pooled by
+        # log-mean-exp; not a localization map, see the docstring)
         self.patch_score = nn.Sequential(nn.LayerNorm(hidden),
                                          nn.Dropout(p_drop),
                                          nn.Linear(hidden, 1))
@@ -66,7 +70,7 @@ class SiameseViT(nn.Module):
 
     def forward(self, a, b, return_map=False):
         ta, tb = self.tokens(a), self.tokens(b)   # [B, N, H] each
-        matched, _ = self.cross(ta, tb, tb)       # best explanation of each
+        matched, attn = self.cross(ta, tb, tb)    # best explanation of each
                                                   # before-patch from after
         z = self.fuse(torch.cat([ta, matched, ta - matched, ta - tb], -1))
         s = self.patch_score(self.reason(z)).squeeze(-1)       # [B, N]
@@ -74,7 +78,10 @@ class SiameseViT(nn.Module):
         # so one confident patch is enough and resolution does not shift it
         logit = torch.logsumexp(s, 1) - math.log(s.shape[1])
         if return_map:
-            return logit, s
+            # s: per-before-patch "gone" scores [B, N]; attn: where each
+            # before-patch looked among the after-patches [B, N, N]
+            # (head-averaged)
+            return logit, s, attn
         return logit
 
     def patch_grid(self, h, w):
@@ -98,6 +105,7 @@ if __name__ == "__main__":
     m = SiameseViT(pretrained=False)
     m.freeze_encoder(True)
     a, b = torch.randn(2, 3, 224, 224), torch.randn(2, 3, 224, 224)
-    logit, pmap = m(a, b, return_map=True)
+    logit, pmap, attn = m(a, b, return_map=True)
     trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
-    print(logit.shape, pmap.shape, f"{trainable/1e3:.0f}k trainable params")
+    print(logit.shape, pmap.shape, attn.shape,
+          f"{trainable/1e3:.0f}k trainable params")

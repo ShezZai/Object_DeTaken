@@ -6,6 +6,7 @@ __pycache__/
 *.pt
 *.keras
 *.jpg
+!docs/images/*.jpg
 siamese_missing/*.json
 !siamese_missing/example.json
 

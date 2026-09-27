@@ -483,26 +483,133 @@ def denorm(t):
     return img.permute(1, 2, 0).numpy().astype(np.uint8)
 
 
-@torch.no_grad()
-def vit_patch_map(model, a, b):
-    """SiameseViT's own per-patch scores as a [0,1] heatmap -- trained by
-    the classification loss, so no gradients needed. Each patch shows
-    sigmoid(score - log N): roughly the pair probability that patch alone
-    would produce. The same map (a before-patch location) goes on both
-    panels: on `after` it marks where the missing thing should have been."""
-    _, s = model(a, b, return_map=True)
+def vit_evidence(model, a, b, mass=0.8, max_patches=8):
+    """Which before-patches made SiameseViT call 'missing', and what in
+    `after` looks most like each of them.
+
+    Attribution: gradient x activation of the pair logit at each
+    before-patch's fused evidence vector (model.fuse output), i.e. before
+    the reasoning transformer mixes the patches. The patch scores
+    themselves cannot be used: that transformer spreads the verdict over
+    every token, so they come out nearly flat (measured on `test`: ~200 of
+    256 patches share the score, vs. ~14 for this attribution). Only the
+    positive part counts -- evidence FOR 'missing'. Patches are taken by
+    share until they cover `mass` of it (at most `max_patches`).
+
+    Best match: the most cosine-similar after-patch in raw DINOv2 features.
+    (The cross-attention's own argmax is uninformative: it collapses onto a
+    handful of high-norm "sink" tokens for every query.) Low similarity =
+    nothing like this patch remains; high similarity elsewhere = it moved.
+
+    Returns (share map [H, W] scaled to [0, 1], boxes), boxes as
+    (share, (x0, y0, x1, y1) in before, (x0, y0, x1, y1) best match in
+    after, cosine similarity).
+    """
+    keep = {}
+
+    def hook(mod, inp, out):
+        out.retain_grad()
+        keep["z"] = out
+
+    handle = model.fuse.register_forward_hook(hook)
+    with torch.enable_grad():
+        logit = model(a, b)
+        model.zero_grad(set_to_none=True)
+        logit.backward()
+    handle.remove()
+    z = keep["z"]
+    attr = (z.grad * z).sum(-1)[0].detach().clamp(min=0)
+    share = attr / attr.sum().clamp(min=1e-12)
+
+    with torch.no_grad():
+        fa, fb = (nn.functional.normalize(
+            model.enc.forward_features(x)[0, model.n_prefix:], dim=-1)
+            for x in (a, b))
+        sim = fa @ fb.T                                   # [N, N] cosine
+
     h, w = a.shape[-2:]
     gh, gw, (ph, pw) = model.patch_grid(h, w)
-    cam = torch.sigmoid(s[0] - np.log(s.shape[1])).view(gh, gw).cpu().numpy()
+
+    def box(i):
+        r, c = divmod(int(i), gw)
+        return (c * pw, r * ph, min((c + 1) * pw, w), min((r + 1) * ph, h))
+
+    boxes, covered = [], 0.0
+    for i in torch.argsort(share, descending=True):
+        if share[i] <= 0:
+            break
+        j = sim[i].argmax()
+        boxes.append((float(share[i]), box(i), box(j), float(sim[i, j])))
+        covered += float(share[i])
+        if covered >= mass or len(boxes) >= max_patches:
+            break
+    heat = (share / share.max().clamp(min=1e-12)).view(gh, gw).cpu().numpy()
     # the grid covers the right/bottom-padded input: upsample, then crop
-    cam = cv2.resize(cam, (gw * pw, gh * ph),
-                     interpolation=cv2.INTER_NEAREST)[:h, :w]
-    return cam, cam
+    heat = cv2.resize(heat, (gw * pw, gh * ph),
+                      interpolation=cv2.INTER_NEAREST)[:h, :w]
+    return heat, boxes
+
+
+def save_vit_panel(path, before_rgb, after_rgb, heat, boxes, caption,
+                   scale=3):
+    """BEFORE | AFTER at `scale`x the network input.
+
+    BEFORE: the patches behind the 'missing' score, red boxes numbered by
+    rank with their share of the score, over a light share heatmap.
+    AFTER: the same places in red (where the thing should still be), and in
+    cyan the most similar after-patch with its cosine similarity (see
+    vit_evidence).
+    """
+    def up(img):
+        return cv2.resize(img, None, fx=scale, fy=scale,
+                          interpolation=cv2.INTER_CUBIC)
+
+    def rect(img, bx, color, thick):
+        x0, y0, x1, y1 = (v * scale for v in bx)
+        cv2.rectangle(img, (x0, y0), (x1 - 1, y1 - 1), color, thick)
+        return x0, y0
+
+    def label(img, text, x, y, color):
+        cv2.putText(img, text, (x + 3, y + 16), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(img, text, (x + 3, y + 16), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, color, 1, cv2.LINE_AA)
+
+    red, cyan = (255, 40, 40), (0, 230, 255)
+    hm = cv2.applyColorMap((np.clip(heat, 0, 1) * 255).astype(np.uint8),
+                           cv2.COLORMAP_JET)[..., ::-1]
+    left = up((0.75 * before_rgb + 0.25 * hm).astype(np.uint8))
+    right = up(after_rgb.copy())
+    for k, (share, bb, match, sim) in enumerate(boxes, 1):
+        x, y = rect(left, bb, red, 2)
+        label(left, f"{k}", x, y, red)
+        x, y = rect(right, bb, red, 1)
+        label(right, str(k), x, y, red)
+        if match != bb:                   # best match elsewhere: show it
+            x, y = rect(right, match, cyan, 1)
+            label(right, str(k), x + (match[2] - match[0]) * scale - 22, y,
+                  cyan)
+    # the key: share of the score and best-match similarity per patch
+    key = [f"{k}: {100 * sh:.0f}% sim {sm:.2f}"
+           for k, (sh, _, _, sm) in enumerate(boxes, 1)]
+    for n, text in enumerate(key):
+        label(left, text, 4, 4 + 20 * n, (255, 255, 255))
+    panel = np.hstack([left, np.full((left.shape[0], 8, 3), 255, np.uint8),
+                       right])
+    strip = np.full((52, panel.shape[1], 3), 255, dtype=np.uint8)
+    cv2.putText(strip, caption, (6, 20), cv2.FONT_HERSHEY_SIMPLEX,
+                0.55, (0, 0, 0), 1, cv2.LINE_AA)
+    cv2.putText(strip, f"BEFORE: red = patches behind the 'missing' score "
+                f"(share of it; top {len(boxes)} = "
+                f"{100 * sum(b[0] for b in boxes):.0f}%)   |   AFTER: red = same "
+                f"place, cyan = most similar patch if elsewhere; sim = its cosine, low = gone",
+                (6, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (60, 60, 60), 1,
+                cv2.LINE_AA)
+    cv2.imwrite(str(path), np.vstack([strip, panel])[..., ::-1])
 
 
 def torch_grad_cam(model, row, size, device, cache=None, aligned=None):
-    """Grad-CAM of the 'missing' logit at the encoder's last spatial layer
-    (SiameseViT: its trained patch map instead, see vit_patch_map).
+    """Grad-CAM of the 'missing' logit at the encoder's last spatial layer.
 
     Returns (before_rgb, after_rgb, cam_before, cam_after): the network's
     actual inputs (denormalized) and one [0,1] heatmap per branch.
@@ -510,8 +617,6 @@ def torch_grad_cam(model, row, size, device, cache=None, aligned=None):
     ds = PairSet([row], size, train=False, cache=cache, aligned=aligned)
     a, b, _ = ds[0]
     a, b = a[None].to(device), b[None].to(device)
-    if hasattr(model, "patch_grid"):
-        return (denorm(a), denorm(b)) + vit_patch_map(model, a, b)
 
     # find the last leaf module that outputs a spatial map
     spatial = []
@@ -1053,6 +1158,30 @@ def ensemble_prob(models, score, before, after, prior=None, mode="platt"):
     return float(sigmoid(np.mean(d))), [float(x) for x in sigmoid(d)]
 
 
+def make_viz(args, models, cache=None, aligned=None):
+    """save(row, path, caption) for the first ensemble member (a map of an
+    average of models is not well defined; captions carry the ensemble's
+    probability): patch evidence for the ViT, Grad-CAM for the CNNs."""
+    model0, size0, _ = models[0]
+    if args.keras:
+        impl = keras_impl()
+        return lambda row, path, caption: save_cam_panel(
+            path, *impl.grad_cam(model0, row, size0, cache, aligned), caption)
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if hasattr(model0, "patch_grid"):
+        def save(row, path, caption):
+            ds = PairSet([row], size0, train=False, cache=cache,
+                         aligned=aligned)
+            a, b, _ = ds[0]
+            a, b = a[None].to(device), b[None].to(device)
+            save_vit_panel(path, denorm(a), denorm(b),
+                           *vit_evidence(model0, a, b), caption)
+        return save
+    return lambda row, path, caption: save_cam_panel(
+        path, *torch_grad_cam(model0, row, size0, device, cache, aligned),
+        caption)
+
+
 def cmd_predict(args):
     if not args.before or not args.after:
         raise SystemExit("error: --before and --after are required "
@@ -1068,6 +1197,12 @@ def cmd_predict(args):
         "models": len(models),
         "per_model": [round(x, 3) for x in per_model],
     }, indent=2))
+    if args.viz:
+        make_viz(args, models)(
+            {"before": args.before, "after": args.after, "y": 0.0}, args.viz,
+            f"p={p:.3f}  {'MISSING' if p > 0.5 else 'no change'}  "
+            f"({Path(args.before).parent.name})")
+        print(f"saved {args.viz}")
 
 
 def cmd_evaluate(args):
@@ -1117,29 +1252,19 @@ def cmd_evaluate(args):
     if args.viz or args.viz_all:
         folder = Path(args.viz or "viz")
         folder.mkdir(parents=True, exist_ok=True)
-        # CAMs come from the first ensemble member (a CAM of an average of
-        # models is not well defined); probabilities shown are the ensemble's
-        model0, size0, _ = models[0]
-        if args.keras:
-            impl = keras_impl()
-            cam_fn = lambda row: impl.grad_cam(model0, row, size0, cache, aligned)
-        else:
-            device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-            cam_fn = lambda row: torch_grad_cam(model0, row, size0, device, cache, aligned)
+        save_panel = make_viz(args, models, cache, aligned)
         chosen = range(len(rows)) if args.viz_all else failures
         for i in chosen:
             r = rows[i]
             pred, truth = p[i] > thr, y[i] == 1
             verdict = ("ok" if pred == truth
                        else "MISSED" if truth else "FALSE_ALARM")
-            before_rgb, after_rgb, cam_a, cam_b = cam_fn(r)
             caption = (f"{r['scene']}/{r['pair']}  p={p[i]:.3f} thr={thr:.3f}  "
                        f"pred={'missing' if pred else 'no change'}  "
                        f"truth={'missing' if truth else 'no change'}  [{verdict}]")
             name = f"{verdict}__{r['scene'].replace('/', '_')}__{r['pair']}.jpg"
-            save_cam_panel(folder / name, before_rgb, after_rgb,
-                           cam_a, cam_b, caption)
-        print(f"saved {len(list(chosen))} grad-cam panels to {folder}/")
+            save_panel(r, folder / name, caption)
+        print(f"saved {len(list(chosen))} panels to {folder}/")
 
 
 def cmd_calibrate(args):
@@ -1310,6 +1435,9 @@ def main():
     p.add_argument("--before", default=None, help="required (flag or config)")
     p.add_argument("--after", default=None, help="required (flag or config)")
     p.add_argument("--prior", type=float, default=None, help=prior_help)
+    p.add_argument("--viz", default=None, metavar="FILE",
+                   help="save a before|after panel to FILE: the patches "
+                        "behind the call (--vit) or Grad-CAM (CNNs)")
     p.add_argument("--calibration", choices=["platt", "threshold"],
                    default=None, help=calib_help)
     p.set_defaults(func=cmd_predict)
@@ -1327,7 +1455,8 @@ def main():
                         "model was trained with --align)")
     e.add_argument("--cache-side", type=int, default=640)
     e.add_argument("--viz", default=None, metavar="FOLDER",
-                   help="save grad-cam panels for failed pairs to FOLDER")
+                   help="save panels for failed pairs to FOLDER: the "
+                        "patches behind the call (--vit) or Grad-CAM (CNNs)")
     e.add_argument("--viz-all", action="store_true",
                    help="visualize every pair, not just failures "
                         "(default folder: viz)")
